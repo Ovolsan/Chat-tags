@@ -9,7 +9,7 @@ __id__ = "chat_tags"
 __name__ = "Теги чатов"
 __description__ = "Личные теги в профилях и поиск чатов по тегам. Компактные подсказки с раскрытием списка."
 __author__ = "Ovolsan"
-__version__ = "20261009"
+__version__ = "20261009.1"
 __icon__ = "msg_hashtag"
 __permissions__ = ["ui", "messages.read", "hooks"]
 
@@ -23,7 +23,7 @@ from base_plugin import BasePlugin, MenuItemData, MenuItemType
 
 MAX_TAGS = 64
 MAX_TAG_LENGTH = 128
-PROFILE_HEIGHT_DP = 90
+PROFILE_HEIGHT_DP = 66
 SUGGESTION_ROW_DP = 40
 MAX_SUGGESTIONS = 2
 SEARCH_PREVIEW_ROWS = 2
@@ -428,10 +428,10 @@ class ChatTagsPlugin(BasePlugin):
         view.setGravity(16)  # CENTER_VERTICAL
         return view
 
-    def _background(self, color, radius=12):
+    def _background(self, color):
         drawable = self.Gradient()
         drawable.setColor(color)
-        drawable.setCornerRadius(float(self._dp(radius)))
+        drawable.setCornerRadius(0.0)
         return drawable
 
     def _attach_profile(self, profile):
@@ -456,20 +456,11 @@ class ChatTagsPlugin(BasePlugin):
         root.setOrientation(1)
         root.setPadding(self._dp(16), self._dp(4), self._dp(16), self._dp(8))
         root.setBackground(self._background(self.Theme.getColor(self.Theme.key_windowBackgroundWhite)))
-        heading = self.Linear(context)
-        heading.setOrientation(0)
-        header = self._text(context, "Теги", 13, True)
-        header.setSingleLine(True)
-        heading.addView(header, self.Linear.LayoutParams(0, -1, 1.0))
-        edit_label = self._text(context, "Изменить", 13, True)
-        heading.addView(edit_label, self.Linear.LayoutParams(-2, -1))
-        root.addView(heading, self.Linear.LayoutParams(-1, self._dp(24)))
         tags = self._text(context, "", 14)
         tags.setMaxLines(2)
         tags.setEllipsize(self.Ellipsize.END)
-        tags.setGravity(48)  # TOP
         root.addView(tags, self.Linear.LayoutParams(-1, 0, 1.0))
-        state = {"profile": profile, "root": root, "header": header, "edit_label": edit_label, "tags": tags,
+        state = {"profile": profile, "root": root, "tags": tags,
                  "account": account, "uid": uid, "did": did}
         root.setOnClickListener(OnClickListener(lambda view: self._edit_tags(state)))
         root.setContentDescription("Теги чата. Нажмите, чтобы добавить или изменить.")
@@ -509,11 +500,8 @@ class ChatTagsPlugin(BasePlugin):
 
     def _render_profile(self, state):
         entry = self._index.get(state["uid"], state["did"])
-        state["edit_label"].setText("Изменить" if entry["tags"] else "Добавить")
         state["tags"].setText(" · ".join("#" + tag for tag in entry["tags"])
-                              if entry["tags"] else "＋ Добавить теги")
-        state["header"].setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteBlueText))
-        state["edit_label"].setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteBlueText))
+                              if entry["tags"] else "＋ Добавить")
         state["tags"].setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteBlackText))
         state["root"].setBackground(self._background(self.Theme.getColor(self.Theme.key_windowBackgroundWhite)))
 
@@ -1002,7 +990,7 @@ class ChatTagsPlugin(BasePlugin):
         from ui.settings import Header, Text, Divider
         return [
             Header("Теги чатов"),
-            Text("Как добавить первый тег", subtext="Профиль чата → ⋮ → Плагины → Добавить / изменить теги. Или нажмите ＋ Добавить теги над кнопками профиля."),
+            Text("Как добавить первый тег", subtext="Профиль чата → ⋮ → Плагины → Добавить / изменить теги. Или нажмите ＋ Добавить над кнопками профиля."),
             Text("Состояние", subtext=getattr(self, "_status", "Плагин выключен")),
             Divider("Теги хранятся только в настройках плагина на этом устройстве, отдельно для каждого аккаунта."),
         ]
