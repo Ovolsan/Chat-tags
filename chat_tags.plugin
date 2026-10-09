@@ -1,0 +1,1029 @@
+# SPDX-License-Identifier: GPL-3.0-only
+"""Local chat tags for exteraLess. This is a single, installable Python plugin.
+
+Android imports are lazy so the index and matching rules can be tested on a PC.
+Target: exteraless/exteraless, commit 00c14f4c26e2cee39b2e966887f2edccd8de8893.
+"""
+
+__id__ = "chat_tags"
+__name__ = "Теги чатов"
+__description__ = "Личные теги в профилях и поиск чатов по тегам. Компактные подсказки с раскрытием списка."
+__author__ = "Ovolsan"
+__version__ = "20261009"
+__icon__ = "msg_hashtag"
+__permissions__ = ["ui", "messages.read", "hooks"]
+
+import copy
+import re
+import threading
+import unicodedata
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+
+
+MAX_TAGS = 64
+MAX_TAG_LENGTH = 128
+PROFILE_HEIGHT_DP = 90
+SUGGESTION_ROW_DP = 40
+MAX_SUGGESTIONS = 2
+SEARCH_PREVIEW_ROWS = 2
+STORE_KEY = "tag_index_v1"
+_SEPARATOR = re.compile(r"[,;\n\r]+")
+_LAST_SEPARATOR = re.compile(r"[,;\n\r]")
+
+
+def clean_tag(value):
+    """Keep phrases intact; collapse whitespace and optional leading #."""
+    value = unicodedata.normalize("NFKC", str(value))
+    value = "".join(c for c in value if unicodedata.category(c) not in ("Cf", "Cs"))
+    return " ".join(value.strip().lstrip("#").split())
+
+
+def normalized(value):
+    return clean_tag(value).casefold().replace("ё", "е")
+
+
+def parse_tags(text):
+    tags, seen = [], set()
+    for part in _SEPARATOR.split(str(text)):
+        tag = clean_tag(part)
+        if not tag:
+            continue
+        if len(tag) > MAX_TAG_LENGTH:
+            raise ValueError("Тег слишком длинный: максимум 128 символов.")
+        key = normalized(tag)
+        if key not in seen:
+            tags.append(tag)
+            seen.add(key)
+    if len(tags) > MAX_TAGS:
+        raise ValueError("Для одного чата можно сохранить до 64 тегов.")
+    return tags
+
+
+def tag_rank(query, tag):
+    query, tag = normalized(query), normalized(tag)
+    if not query:
+        return None
+    if tag == query:
+        return 0
+    if tag.startswith(query):
+        return 1
+    if query in tag:
+        return 2
+    if all(word in tag for word in query.split()):
+        return 3
+    return None
+
+
+def replace_last_tag(text, suggestion):
+    separators = list(_LAST_SEPARATOR.finditer(text))
+    start = separators[-1].end() if separators else 0
+    return text[:start] + clean_tag(suggestion) + "\n"
+
+
+def encrypted_dialog_id(chat_id):
+    return 0x4000000000000000 | (int(chat_id) & 0xffffffff)
+
+
+def pack_chat_rows(widths, available_width, gap):
+    """Wrap measured chat buttons, preserving order and every dialog.
+
+    A long title occupies one full row and is ellipsized by its TextView.
+    Row limits apply to the preview, never to the list of search matches.
+    """
+    available_width = max(1, int(available_width))
+    rows, row, used = [], [], 0
+    for index, natural_width in enumerate(widths):
+        width = min(available_width, max(1, int(natural_width)))
+        extra = gap if row else 0
+        if row and used + extra + width > available_width:
+            rows.append(row)
+            row, used, extra = [], 0, 0
+        row.append((index, width))
+        used += extra + width
+    if row:
+        rows.append(row)
+    return rows
+
+
+class TagIndex:
+    """Accounts are keyed by Telegram user id, never a reusable account slot.
+
+    All readers get snapshots. The UI writes while localSearch reads from the
+    storage queue; neither thread sees a partly updated list or dictionary.
+    """
+
+    def __init__(self, payload=None):
+        self._lock = threading.RLock()
+        self._data = {"version": 1, "accounts": {}}
+        if payload is None:
+            return
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("Неизвестный формат сохранённых тегов.")
+        accounts = payload.get("accounts")
+        if not isinstance(accounts, dict):
+            raise ValueError("Повреждено хранилище тегов.")
+        for uid, dialogs in accounts.items():
+            if not str(uid).isdigit() or int(uid) <= 0 or not isinstance(dialogs, dict):
+                raise ValueError("Повреждена запись аккаунта в хранилище тегов.")
+            target = {}
+            for did, entry in dialogs.items():
+                try:
+                    dialog_id = int(did)
+                except (TypeError, ValueError):
+                    raise ValueError("Повреждён идентификатор чата.")
+                if dialog_id == 0 or not isinstance(entry, dict):
+                    raise ValueError("Повреждена запись чата.")
+                tags = entry.get("tags")
+                if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+                    raise ValueError("Повреждён список тегов.")
+                # Do not silently split legacy phrases containing a comma.
+                cleaned, seen = [], set()
+                for tag in tags:
+                    value = clean_tag(tag)
+                    if len(value) > MAX_TAG_LENGTH:
+                        raise ValueError("В хранилище найден слишком длинный тег.")
+                    if value and normalized(value) not in seen:
+                        cleaned.append(value)
+                        seen.add(normalized(value))
+                if len(cleaned) > MAX_TAGS:
+                    raise ValueError("В хранилище слишком много тегов для чата.")
+                if cleaned:
+                    target[str(dialog_id)] = {
+                        "title": str(entry.get("title") or "Чат"), "tags": cleaned,
+                    }
+            if target:
+                self._data["accounts"][str(int(uid))] = target
+
+    def dump(self):
+        with self._lock:
+            return copy.deepcopy(self._data)
+
+    def account(self, uid):
+        with self._lock:
+            return copy.deepcopy(self._data["accounts"].get(str(int(uid)), {}))
+
+    def get(self, uid, did):
+        return self.account(uid).get(str(int(did)), {"title": "Чат", "tags": []})
+
+    def set(self, uid, did, title, tags):
+        uid, did = str(int(uid)), str(int(did))
+        if int(uid) <= 0 or int(did) == 0:
+            raise ValueError("Не удалось определить аккаунт или чат.")
+        # The same validation applies to editor writes and settings imports.
+        entry = {"title": str(title or "Чат"), "tags": list(tags)}
+        validated = TagIndex({"version": 1, "accounts": {uid: {did: entry}}})
+        with self._lock:
+            cleaned_entry = validated.get(uid, did)
+            if cleaned_entry["tags"]:
+                self._data["accounts"].setdefault(uid, {})[did] = cleaned_entry
+            else:
+                dialogs = self._data["accounts"].get(uid, {})
+                dialogs.pop(did, None)
+                if not dialogs:
+                    self._data["accounts"].pop(uid, None)
+
+    def matches(self, uid, query, limit=None):
+        if not normalized(query):
+            return []
+        matches = []
+        for did, entry in self.account(uid).items():
+            candidates = [(tag_rank(query, tag), tag) for tag in entry["tags"]]
+            candidates = [(rank, tag) for rank, tag in candidates if rank is not None]
+            if not candidates:
+                continue
+            rank, tag = min(candidates, key=lambda item: (item[0], normalized(item[1])))
+            matches.append({"did": int(did), "title": entry["title"], "tag": tag, "rank": rank})
+        matches.sort(key=lambda item: (item["rank"], normalized(item["title"]), item["did"]))
+        return matches if limit is None else matches[:limit]
+
+    def suggestions(self, uid, query, exclude=(), limit=MAX_SUGGESTIONS):
+        used, seen, candidates = {normalized(t) for t in exclude}, set(), []
+        for entry in self.account(uid).values():
+            for tag in entry["tags"]:
+                key, rank = normalized(tag), tag_rank(query, tag)
+                if key in used or key in seen or rank is None:
+                    continue
+                seen.add(key)
+                candidates.append((rank, key, tag))
+        candidates.sort()
+        return [item[2] for item in candidates[:limit]]
+
+
+class ChatTagsPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._active = True
+        self._hooks = []
+        self._profiles = {}
+        self._prepared = set()
+        self._searches = {}
+        self._dialogs = []
+        self._errors = set()
+        self._menu_id = None
+        self._hooks_ready = False
+        self._status = "Запуск"
+        try:
+            self._index = TagIndex(self.get_setting(STORE_KEY, None))
+        except ValueError as error:
+            self._active = False
+            self._status = str(error) + " Сохранение отключено, данные оставлены в настройках."
+            self.log(self._status)
+            return
+        try:
+            self._init_android()
+            self._register_profile_menu()
+        except Exception as error:
+            self._active = False
+            self._status = "Не подключено: " + str(error)
+            self.log(self._status)
+            return
+        try:
+            self._register_hooks()
+            self._hooks_ready = True
+            self._status = "Профили и поиск подключены; редактор также доступен в меню профиля"
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(self._attach_current_profile)
+        except Exception as error:
+            for hook in self._hooks:
+                self.unhook_method(hook)
+            self._hooks.clear()
+            # The public profile-menu API works independently of Java hooks.
+            # Keep first-tag creation available when embedding is unavailable.
+            self._status = "Редактор доступен через ⋮ → Плагины → Добавить / изменить теги. Встраивание отключено: " + str(error)
+            self.log(self._status)
+
+    def _init_android(self):
+        from java import jclass, dynamic_proxy, jlong, jint
+        from hook_utils import get_private_field, set_private_field
+        self._jlong, self._jint = jlong, jint
+        self._get, self._set = get_private_field, set_private_field
+        names = {
+            "AU": "org.telegram.messenger.AndroidUtilities",
+            "Theme": "org.telegram.ui.ActionBar.Theme",
+            "UserConfig": "org.telegram.messenger.UserConfig",
+            "Controller": "org.telegram.messenger.MessagesController",
+            "DialogObject": "org.telegram.messenger.DialogObject",
+            "UserObject": "org.telegram.messenger.UserObject",
+            "Profile": "org.telegram.ui.ProfileActivity",
+            "Pager": "org.telegram.ui.Components.SearchViewPager",
+            "Dialogs": "org.telegram.ui.DialogsActivity",
+            "Chat": "org.telegram.ui.ChatActivity",
+            "TLUser": "org.telegram.tgnet.TLRPC$User",
+            "TLChat": "org.telegram.tgnet.TLRPC$Chat",
+            "TLEncrypted": "org.telegram.tgnet.TLRPC$EncryptedChat",
+            "Linear": "android.widget.LinearLayout",
+            "Scroll": "android.widget.ScrollView",
+            "Frame": "android.widget.FrameLayout",
+            "Text": "android.widget.TextView",
+            "Edit": "org.telegram.ui.Components.EditTextBoldCursor",
+            "Gradient": "android.graphics.drawable.GradientDrawable",
+            "Ellipsize": "android.text.TextUtils$TruncateAt",
+            "Bundle": "android.os.Bundle",
+            "JString": "java.lang.String",
+            "System": "java.lang.System",
+            "InputType": "android.text.InputType",
+        }
+        for alias, name in names.items():
+            setattr(self, alias, jclass(name))
+
+        class Watcher(dynamic_proxy(jclass("android.text.TextWatcher"))):
+            def beforeTextChanged(self, text, start, count, after):
+                pass
+
+            def onTextChanged(self, text, start, before, count):
+                pass
+
+            def afterTextChanged(self, text):
+                from android_utils import safe_call
+                safe_call(self.callback, str(text))
+
+        self._Watcher = Watcher
+
+        class LayoutListener(dynamic_proxy(jclass("android.view.View$OnLayoutChangeListener"))):
+            def onLayoutChange(self, view, left, top, right, bottom,
+                               old_left, old_top, old_right, old_bottom):
+                from android_utils import safe_call
+                safe_call(self.callback, int(right - left), int(bottom - top))
+
+        self._LayoutListener = LayoutListener
+
+    def _dp(self, value):
+        return int(self.AU.dp(float(value)))
+
+    def _key(self, obj):
+        return int(self.System.identityHashCode(obj))
+
+    def _uid(self, account):
+        return int(self.UserConfig.getInstance(int(account)).getClientUserId())
+
+    def _guard(self, label, callback):
+        def guarded(param):
+            if not self._active:
+                return
+            try:
+                callback(param)
+            except Exception as error:
+                if label not in self._errors:
+                    self._errors.add(label)
+                    self.log(label + ": " + str(error))
+                    self._status = "Ошибка " + label + ": " + str(error) + ". Редактор доступен в меню профиля."
+        return guarded
+
+    def _register_profile_menu(self):
+        self._menu_id = self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.PROFILE_ACTION_MENU,
+            text="Добавить / изменить теги",
+            icon="msg_hashtag",
+            item_id="chat_tags_edit",
+            on_click=self._on_profile_menu,
+        ))
+        if not self._menu_id:
+            raise RuntimeError("Не удалось добавить редактор в меню профиля")
+
+    def _on_profile_menu(self, context):
+        if not self._active:
+            return
+        profile = context.get("fragment")
+        if profile is None:
+            return
+        account = int(profile.getCurrentAccount())
+        uid = self._uid(account)
+        did = int(profile.getDialogId())
+        if uid <= 0 or did == 0:
+            return
+        state = {"profile": profile, "context": profile.getParentActivity(),
+                 "account": account, "uid": uid, "did": did}
+        self._edit_tags(state)
+
+    def _hook(self, clazz, name, count, before=None, after=None):
+        # Exact overloads are important: the no-argument height method delegates
+        # to the boolean overload. Hooking both would reserve the space twice.
+        methods = [m for m in clazz.getClass().getDeclaredMethods()
+                   if str(m.getName()) == name and len(m.getParameterTypes()) == count]
+        if len(methods) != 1:
+            raise RuntimeError("Несовместимый метод " + name)
+        method = methods[0]
+        method.setAccessible(True)
+        hook = self.hook_method(
+            method,
+            before=self._guard(name, before) if before else None,
+            after=self._guard(name, after) if after else None,
+        )
+        if not hook:
+            raise RuntimeError("Нужен уровень «Доверенный» и разрешения hooks, messages.read")
+        self._hooks.append(hook)
+
+    def _register_hooks(self):
+        from java import jclass
+        self.Storage = jclass("org.telegram.messenger.MessagesStorage")
+        self._hook(self.Profile, "getActionsExtraHeight", 1, after=self._profile_height)
+        self._hook(self.Profile, "createView", 1,
+                   before=self._before_profile_create, after=self._after_profile_create)
+        self._hook(self.Profile, "updateActionsPosition", 0, after=self._profile_position)
+        self._hook(self.Profile, "onResume", 0, after=self._profile_resume)
+        self._hook(self.Profile, "onFragmentDestroy", 0, before=self._profile_destroy)
+        self._hook(self.Storage, "localSearch", 7, after=self._local_search)
+        self._hook(self.Pager, "onTextChanged", 1, after=self._search_changed)
+        self._hook(self.Pager, "setPagesPadding", 3, after=self._search_padding)
+        self._hook(self.Pager, "clear", 0, after=self._search_clear)
+        self._hook(self.Pager, "onAttachedToWindow", 0, after=self._search_attach)
+        self._hook(self.Pager, "onDetachedFromWindow", 0, after=self._search_detach)
+
+    def _profile_height(self, param):
+        if int(param.thisObject.getDialogId()) != 0:
+            param.setResult(self._jint(int(param.getResult()) + self._dp(PROFILE_HEIGHT_DP)))
+
+    def _before_profile_create(self, param):
+        key = self._key(param.thisObject)
+        self._remove_profile(key, restore=False)
+        self._prepared.add(key)
+
+    def _after_profile_create(self, param):
+        if param.getThrowable() is None:
+            self._attach_profile(param.thisObject)
+
+    def _profile_resume(self, param):
+        self._attach_profile(param.thisObject)
+
+    def _profile_destroy(self, param):
+        key = self._key(param.thisObject)
+        self._remove_profile(key, restore=False)
+        self._prepared.discard(key)
+
+    def _attach_current_profile(self):
+        if not self._active or not self._hooks_ready:
+            return
+        from client_utils import get_last_fragment
+        fragment = get_last_fragment()
+        if fragment is not None and isinstance(fragment, self.Profile):
+            self._attach_profile(fragment)
+
+    def _text(self, context, text, size=14, accent=False):
+        view = self.Text(context)
+        view.setText(str(text))
+        view.setTextSize(float(size))
+        view.setTextColor(self.Theme.getColor(
+            self.Theme.key_windowBackgroundWhiteBlueText if accent
+            else self.Theme.key_windowBackgroundWhiteBlackText))
+        view.setGravity(16)  # CENTER_VERTICAL
+        return view
+
+    def _background(self, color, radius=12):
+        drawable = self.Gradient()
+        drawable.setColor(color)
+        drawable.setCornerRadius(float(self._dp(radius)))
+        return drawable
+
+    def _attach_profile(self, profile):
+        if not self._active or int(profile.getDialogId()) == 0:
+            return
+        key = self._key(profile)
+        state = self._profiles.get(key)
+        if state is not None:
+            self._render_profile(state)
+            self._position_profile(state)
+            return
+        parent = self._get(profile, "avatarContainer2")
+        if parent is None:
+            return
+        account, did = int(profile.getCurrentAccount()), int(profile.getDialogId())
+        uid = self._uid(account)
+        if uid <= 0:
+            return
+        context = parent.getContext()
+        from android_utils import OnClickListener
+        root = self.Linear(context)
+        root.setOrientation(1)
+        root.setPadding(self._dp(16), self._dp(4), self._dp(16), self._dp(8))
+        root.setBackground(self._background(self.Theme.getColor(self.Theme.key_windowBackgroundWhite)))
+        heading = self.Linear(context)
+        heading.setOrientation(0)
+        header = self._text(context, "Теги", 13, True)
+        header.setSingleLine(True)
+        heading.addView(header, self.Linear.LayoutParams(0, -1, 1.0))
+        edit_label = self._text(context, "Изменить", 13, True)
+        heading.addView(edit_label, self.Linear.LayoutParams(-2, -1))
+        root.addView(heading, self.Linear.LayoutParams(-1, self._dp(24)))
+        tags = self._text(context, "", 14)
+        tags.setMaxLines(2)
+        tags.setEllipsize(self.Ellipsize.END)
+        tags.setGravity(48)  # TOP
+        root.addView(tags, self.Linear.LayoutParams(-1, 0, 1.0))
+        state = {"profile": profile, "root": root, "header": header, "edit_label": edit_label, "tags": tags,
+                 "account": account, "uid": uid, "did": did}
+        root.setOnClickListener(OnClickListener(lambda view: self._edit_tags(state)))
+        root.setContentDescription("Теги чата. Нажмите, чтобы добавить или изменить.")
+        root.setVisibility(4)
+        params = self.Frame.LayoutParams(-1, self._dp(PROFILE_HEIGHT_DP))
+        parent.addView(root, params)
+        self._profiles[key] = state
+        if key not in self._prepared:
+            # Plugin enabled while this profile was already created.
+            value = self._get(profile, "extraHeight")
+            if value is not None:
+                self._set(profile, "extraHeight", self._java_float(float(value) + self._dp(PROFILE_HEIGHT_DP)))
+        self._prepared.add(key)
+        self._render_profile(state)
+        parent.requestLayout()
+        self._position_profile(state)
+
+    def _java_float(self, value):
+        from java import jfloat
+        return jfloat(value)
+
+    def _profile_title(self, state):
+        controller = self.Controller.getInstance(state["account"])
+        did = state["did"]
+        if self.DialogObject.isEncryptedDialog(self._jlong(did)):
+            encrypted = controller.getEncryptedChat(self.DialogObject.getEncryptedChatId(self._jlong(did)))
+            obj = controller.getUser(encrypted.user_id) if encrypted is not None else None
+        elif did < 0:
+            obj = controller.getChat(self._jlong(-did))
+        else:
+            obj = controller.getUser(self._jlong(did))
+        if obj is not None:
+            if isinstance(obj, self.TLChat):
+                return str(obj.title or "Чат")
+            return str(self.UserObject.getUserName(obj) or "Чат")
+        return self._index.get(state["uid"], did)["title"]
+
+    def _render_profile(self, state):
+        entry = self._index.get(state["uid"], state["did"])
+        state["edit_label"].setText("Изменить" if entry["tags"] else "Добавить")
+        state["tags"].setText(" · ".join("#" + tag for tag in entry["tags"])
+                              if entry["tags"] else "＋ Добавить теги")
+        state["header"].setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteBlueText))
+        state["edit_label"].setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteBlueText))
+        state["tags"].setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteBlackText))
+        state["root"].setBackground(self._background(self.Theme.getColor(self.Theme.key_windowBackgroundWhite)))
+
+    def _profile_position(self, param):
+        state = self._profiles.get(self._key(param.thisObject))
+        if state is not None:
+            profile = state["profile"]
+            # The gallery-opening branch uses the image width directly rather
+            # than getActionsExtraHeight. Reserve the tag slot in that branch
+            # as well; the original method has just reset this translation.
+            if (bool(self._get(profile, "openAnimationInProgress"))
+                    and int(self._get(profile, "playProfileAnimation") or 0) == 2):
+                actions = self._get(profile, "actionsView")
+                if actions is not None:
+                    actions.setTranslationY(float(actions.getTranslationY()) + self._dp(PROFILE_HEIGHT_DP))
+            self._position_profile(state)
+
+    def _position_profile(self, state):
+        profile, root = state["profile"], state["root"]
+        actions = self._get(profile, "actionsView")
+        action_bar = profile.getActionBar()
+        top = int(action_bar.getCurrentActionBarHeight())
+        if action_bar.getOccupyStatusBar():
+            top += int(self.AU.statusBarHeight)
+        height = self._dp(PROFILE_HEIGHT_DP)
+        if actions is not None:
+            y = float(actions.getTranslationY()) - height
+            alpha = float(actions.getAlpha())
+        else:
+            y = float(self._get(profile, "extraHeight") or 0) + top - height
+            alpha = 1.0
+        root.setTranslationY(float(y))
+        # During collapse the block disappears at the action bar edge instead
+        # of drawing over the title, avatar, or the native action buttons.
+        visible = y >= top - self._dp(1) and not bool(self._get(profile, "openAnimationInProgress"))
+        root.setAlpha(float(alpha if visible else 0))
+        root.setVisibility(0 if visible else 4)
+
+    def _remove_profile(self, key, restore):
+        state = self._profiles.pop(key, None)
+        if state is None:
+            return
+        root, profile = state["root"], state["profile"]
+        root.setOnClickListener(None)
+        parent = root.getParent()
+        if parent is not None:
+            parent.removeView(root)
+        if restore:
+            extra = float(self._get(profile, "extraHeight") or 0)
+            self._set(profile, "extraHeight", self._java_float(max(0, extra - self._dp(PROFILE_HEIGHT_DP))))
+        fragment_view = profile.getFragmentView()
+        if fragment_view is not None:
+            fragment_view.requestLayout()
+
+    def _save_tags(self, state, text):
+        if not self._active or self._uid(state["account"]) != state["uid"]:
+            raise ValueError("Аккаунт изменился. Откройте профиль заново.")
+        tags = parse_tags(text)
+        updated = TagIndex(self._index.dump())
+        updated.set(state["uid"], state["did"], self._profile_title(state), tags)
+        payload = updated.dump()
+        self.set_setting(STORE_KEY, payload)
+        if self.get_setting(STORE_KEY, None) != payload:
+            raise ValueError("Не удалось сохранить теги. Попробуйте снова.")
+        self._index = updated
+        for profile in self._profiles.values():
+            if profile["uid"] == state["uid"] and profile["did"] == state["did"]:
+                self._render_profile(profile)
+        for search in list(self._searches.values()):
+            self._update_suggestions(search)
+
+    def _edit_tags(self, state):
+        if not self._active:
+            return
+        from android_utils import OnClickListener
+        from ui.alert import AlertDialogBuilder
+        from ui.bulletin import BulletinHelper
+        context = state.get("context")
+        if context is None:
+            context = state["root"].getContext()
+        content = self.Linear(context)
+        content.setOrientation(1)
+        content.setPadding(self._dp(20), 0, self._dp(20), self._dp(8))
+        explanation = self._text(context, "Каждый тег — с новой строки или через запятую.\nФраза с пробелами — один тег.", 13)
+        explanation.setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteGrayText))
+        content.addView(explanation, self.Linear.LayoutParams(-1, -2))
+        edit = self.Edit(context)
+        edit.setTextSize(16.0)
+        edit.setTextColor(self.Theme.getColor(self.Theme.key_dialogTextBlack))
+        edit.setHintTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteHintText))
+        edit.setHint("телеграм\ntelegram\nальтернативные клиенты телеграм")
+        edit.setInputType(self.InputType.TYPE_CLASS_TEXT | self.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                          | self.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        edit.setGravity(48)
+        edit.setMaxLines(6)
+        edit.setMinLines(3)
+        edit.setPadding(0, self._dp(8), 0, self._dp(8))
+        entry = self._index.get(state["uid"], state["did"])
+        edit.setText("\n".join(entry["tags"]))
+        content.addView(edit, self.Linear.LayoutParams(-1, self._dp(140)))
+        suggestions = self.Linear(context)
+        suggestions.setOrientation(1)
+        content.addView(suggestions, self.Linear.LayoutParams(-1, -2))
+        error_view = self._text(context, "", 13)
+        error_view.setTextColor(self.Theme.getColor(self.Theme.key_text_RedRegular))
+        error_view.setVisibility(8)
+        content.addView(error_view, self.Linear.LayoutParams(-1, -2))
+        builder = AlertDialogBuilder(context)
+        builder.set_title("Теги: " + self._profile_title(state)).set_view(content)
+        builder.set_negative_button("Отмена").set_positive_button("Сохранить")
+        self._dialogs.append(builder)
+
+        def complete(value):
+            edit.setText(replace_last_tag(str(edit.getText()), value))
+            edit.setSelection(edit.length())
+
+        def update(text):
+            if not self._active:
+                return
+            suggestions.removeAllViews()
+            prefix = _SEPARATOR.split(text)[-1]
+            try:
+                excluded = parse_tags(text)
+            except ValueError:
+                excluded = []
+            for tag in self._index.suggestions(state["uid"], prefix, excluded):
+                row = self._text(context, "#" + tag, 14, True)
+                row.setSingleLine(True)
+                row.setEllipsize(self.Ellipsize.END)
+                row.setOnClickListener(OnClickListener(
+                    lambda view, value=tag: complete(value)))
+                suggestions.addView(row, self.Linear.LayoutParams(-1, self._dp(SUGGESTION_ROW_DP)))
+
+        watcher = self._Watcher()
+        watcher.callback = update
+        edit.addTextChangedListener(watcher)
+
+        def dismissed(dialog_builder):
+            edit.removeTextChangedListener(watcher)
+            suggestions.removeAllViews()
+            if dialog_builder in self._dialogs:
+                self._dialogs.remove(dialog_builder)
+
+        builder.set_on_dismiss_listener(dismissed)
+        builder.show()
+
+        def save(view):
+            try:
+                self._save_tags(state, str(edit.getText()))
+            except ValueError as error:
+                error_view.setText(str(error))
+                error_view.setVisibility(0)
+                return
+            builder.dismiss()
+            BulletinHelper.show_success("Теги сохранены", state["profile"])
+
+        # Native AlertDialog buttons dismiss automatically; replacing the
+        # listener after show keeps invalid text editable and reports the error.
+        builder.get_button(-1).setOnClickListener(OnClickListener(save))
+        update(str(edit.getText()))
+        edit.setSelection(edit.length())
+        edit.requestFocus()
+        self.AU.showKeyboard(edit)
+
+    def _object_id(self, obj):
+        if isinstance(obj, self.TLUser):
+            return int(obj.id)
+        if isinstance(obj, self.TLChat):
+            return -int(obj.id)
+        if isinstance(obj, self.TLEncrypted):
+            return encrypted_dialog_id(obj.id)
+        return 0
+
+    def _resolve_dialog(self, account, did, storage, sync=False):
+        """Direct reads on the storage queue; sync reads only on a worker queue."""
+        controller = self.Controller.getInstance(account)
+        if self.DialogObject.isEncryptedDialog(self._jlong(did)):
+            enc_id = self.DialogObject.getEncryptedChatId(self._jlong(did))
+            obj = controller.getEncryptedChat(enc_id)
+            if obj is None:
+                obj = (controller.getEncryptedChatDB(enc_id, False) if sync
+                       else storage.getEncryptedChat(self._jlong(enc_id)))
+            if obj is None:
+                return None, None
+            user = controller.getUser(obj.user_id)
+            if user is None:
+                user = storage.getUserSync(obj.user_id) if sync else storage.getUser(obj.user_id)
+            return (obj, user) if user is not None else (None, None)
+        if did < 0:
+            obj = controller.getChat(self._jlong(-did))
+            if obj is None:
+                obj = (storage.getChatSync(self._jlong(-did)) if sync
+                       else storage.getChat(self._jlong(-did)))
+            return obj, None
+        obj = controller.getUser(self._jlong(did))
+        if obj is None:
+            obj = storage.getUserSync(self._jlong(did)) if sync else storage.getUser(self._jlong(did))
+        return obj, None
+
+    def _local_search(self, param):
+        if param.getThrowable() is not None or int(param.args[0]) != 0:
+            return  # General chat search; leave peer pickers' eligibility intact.
+        storage = param.thisObject
+        account = self._get(storage, "currentAccount")
+        if account is None:
+            return
+        account = int(account)
+        results, names, enc_users = param.args[2], param.args[3], param.args[4]
+        matches = self._index.matches(self._uid(account), str(param.args[1]))
+        if not matches:
+            return
+        allowed = param.args[5]
+        allowed_ids = {int(v) for v in allowed} if allowed is not None else None
+        existing = {self._object_id(obj) for obj in results}
+        # Append pairs together so ProfileSearchCell receives aligned arrays.
+        for match in matches:
+            did = match["did"]
+            if did in existing or (allowed_ids is not None and did not in allowed_ids):
+                continue
+            obj, enc_user = self._resolve_dialog(account, did, storage)
+            if obj is None or (isinstance(obj, self.TLUser) and obj.deleted):
+                continue
+            if isinstance(obj, self.TLChat):
+                title = str(obj.title or match["title"])
+            else:
+                title = str(self.UserObject.getUserName(enc_user if enc_user is not None else obj))
+            results.add(obj)
+            names.add(self.JString(title))
+            if enc_user is not None:
+                # ProfileSearchCell resolves encrypted chats from this cache.
+                # putEncryptedChat writes a ConcurrentHashMap; it is safe here.
+                self.Controller.getInstance(account).putEncryptedChat(obj, True)
+                enc_users.add(enc_user)
+            existing.add(did)
+
+    def _search_changed(self, param):
+        pager = param.thisObject
+        key = self._key(pager)
+        state = self._searches.get(key)
+        if state is None:
+            parent = self._get(pager, "parent")
+            if parent is None or bool(self._get(parent, "onlySelect")):
+                return
+            state = self._attach_search(pager, parent)
+        state["query"] = str(param.args[0]) if param.args[0] is not None else ""
+        self._update_suggestions(state)
+
+    def _attach_search(self, pager, parent):
+        container = pager.searchContainer
+        root = self.Linear(container.getContext())
+        root.setOrientation(1)
+        root.setPadding(self._dp(12), self._dp(4), self._dp(12), self._dp(4))
+        root.setBackgroundColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhite))
+        root.setVisibility(8)
+        scroll = self.Scroll(container.getContext())
+        scroll.setFillViewport(False)
+        rows = self.Linear(container.getContext())
+        rows.setOrientation(1)
+        scroll.addView(rows, self.Frame.LayoutParams(-1, -2))
+        root.addView(scroll, self.Linear.LayoutParams(-1, 0))
+        toggle = self._text(container.getContext(), "", 13, True)
+        toggle.setGravity(17)
+        toggle.setSingleLine(True)
+        toggle.setVisibility(8)
+        root.addView(toggle, self.Linear.LayoutParams(-1, self._dp(36)))
+        params = self.Frame.LayoutParams(-1, -2)
+        params.gravity = 48
+        container.addView(root, params)
+        state = {"pager": pager, "parent": parent, "root": root, "height": 0, "query": "",
+                 "scroll": scroll, "rows": rows, "toggle": toggle, "matches": [],
+                 "expanded": False, "identity": None, "size": None}
+        self._searches[self._key(pager)] = state
+        from android_utils import OnClickListener
+        toggle.setOnClickListener(OnClickListener(lambda view: self._toggle_suggestions(state)))
+        listener = self._LayoutListener()
+        listener.callback = lambda width, height: self._search_size(state, width, height)
+        state["layout_listener"] = listener
+        container.addOnLayoutChangeListener(listener)
+        return state
+
+    def _update_suggestions(self, state):
+        pager = state["pager"]
+        account = int(state["parent"].getCurrentAccount())
+        uid = self._uid(account)
+        adapter = pager.dialogsSearchAdapter
+        delegate = adapter.delegate
+        is_forum = delegate is not None and int(delegate.getSearchForumDialogId()) != 0
+        filters = self._get(pager, "currentSearchFilters")
+        identity = (account, uid, normalized(state["query"]))
+        if state["identity"] != identity:
+            state["expanded"] = False
+            state["identity"] = identity
+            state["scroll"].scrollTo(0, 0)
+        state["account"], state["uid"] = account, uid
+        state["matches"] = [] if is_forum or (filters is not None and filters.size() > 0) else self._index.matches(
+            uid, state["query"])
+        self._render_suggestions(state)
+
+    def _search_size(self, state, width, height):
+        if self._active and state["size"] != (width, height):
+            state["size"] = (width, height)
+            self._render_suggestions(state)
+
+    def _toggle_suggestions(self, state):
+        if not self._active:
+            return
+        state["expanded"] = not state["expanded"]
+        state["scroll"].scrollTo(0, 0)
+        self._render_suggestions(state)
+
+    def _render_suggestions(self, state):
+        from android_utils import OnClickListener
+        pager, root, rows = state["pager"], state["root"], state["rows"]
+        matches = state["matches"]
+        rows.removeAllViews()
+        if not matches:
+            state["expanded"] = False
+            state["height"] = 0
+            root.setVisibility(8)
+            self._apply_search_padding(state)
+            return
+        container = pager.searchContainer
+        width = int(container.getWidth() or pager.getMeasuredWidth() or self.AU.displaySize.x)
+        width = max(1, width - root.getPaddingLeft() - root.getPaddingRight())
+        gap, row_gap = self._dp(6), self._dp(4)
+        chips, widths, row_height = [], [], self._dp(SUGGESTION_ROW_DP)
+        account, uid = state["account"], state["uid"]
+        for match in matches:
+            chip = self._text(root.getContext(), match["title"], 14, True)
+            chip.setSingleLine(True)
+            chip.setEllipsize(self.Ellipsize.END)
+            chip.setPadding(self._dp(12), self._dp(6), self._dp(12), self._dp(6))
+            chip.setBackground(self._background(self.Theme.getColor(self.Theme.key_windowBackgroundGray)))
+            chip.setContentDescription("Найден по тегу: " + match["title"])
+            chip.setOnClickListener(OnClickListener(
+                lambda view, did=match["did"]: self._open_dialog(state, account, uid, did)))
+            chip.measure(0, 0)  # UNSPECIFIED: actual font scale and shaped title width.
+            chips.append(chip)
+            widths.append(int(chip.getMeasuredWidth()))
+            row_height = max(row_height, int(chip.getMeasuredHeight()))
+        packed = pack_chat_rows(widths, width, gap)
+        overflow = len(packed) > SEARCH_PREVIEW_ROWS
+        if not overflow:
+            state["expanded"] = False
+        visible_rows = packed if state["expanded"] else packed[:SEARCH_PREVIEW_ROWS]
+        for row_index, packed_row in enumerate(visible_rows):
+            line = self.Linear(root.getContext())
+            line.setOrientation(0)
+            for column, (index, chip_width) in enumerate(packed_row):
+                params = self.Linear.LayoutParams(chip_width, row_height)
+                if column:
+                    params.leftMargin = gap
+                line.addView(chips[index], params)
+            params = self.Linear.LayoutParams(-1, row_height)
+            if row_index:
+                params.topMargin = row_gap
+            rows.addView(line, params)
+        content_height = len(visible_rows) * (row_height + row_gap) - row_gap
+        if state["expanded"]:
+            top = int(self._get(pager, "pagesPaddingTop") or 0)
+            bottom = int(self._get(pager, "pagesPaddingBottom") or 0)
+            available = max(0, int(container.getHeight()) - top - bottom)
+            # Keep normal results reachable, including with the keyboard open.
+            viewport = max(row_height, min(self._dp(264), available // 2 - self._dp(44)))
+            content_height = min(content_height, viewport)
+        scroll = state["scroll"]
+        params = scroll.getLayoutParams()
+        params.height = content_height
+        scroll.setLayoutParams(params)
+        scroll.setVerticalScrollBarEnabled(bool(state["expanded"]))
+        toggle = state["toggle"]
+        toggle.setVisibility(0 if overflow else 8)
+        toggle_height = 0
+        if overflow:
+            label = "Свернуть ⌃" if state["expanded"] else "Показать все ({}) ⌄".format(len(matches))
+            toggle.setText(label)
+            toggle.setContentDescription(label)
+            toggle.measure(0, 0)
+            toggle_height = max(self._dp(36), int(toggle.getMeasuredHeight()))
+            params = toggle.getLayoutParams()
+            params.height = toggle_height
+            toggle.setLayoutParams(params)
+        state["height"] = content_height + toggle_height + root.getPaddingTop() + root.getPaddingBottom()
+        root.setVisibility(0)
+        self._apply_search_padding(state)
+
+    def _search_padding(self, param):
+        state = self._searches.get(self._key(param.thisObject))
+        if state is not None:
+            self._apply_search_padding(state)
+
+    def _apply_search_padding(self, state):
+        pager, root, height = state["pager"], state["root"], state["height"]
+        top = int(self._get(pager, "pagesPaddingTop") or 0)
+        bottom = int(self._get(pager, "pagesPaddingBottom") or 0)
+        view = pager.searchListView
+        view.setPadding(view.getPaddingLeft(), top + height, view.getPaddingRight(), bottom, False)
+        params = root.getLayoutParams()
+        if params.topMargin != top or params.height != height:
+            params.topMargin = top
+            params.height = height
+            root.setLayoutParams(params)
+        empty = pager.emptyView
+        if empty is not None:
+            params = empty.getLayoutParams()
+            if params.topMargin != top + height:
+                params.topMargin = top + height
+                empty.setLayoutParams(params)
+        root.bringToFront()
+
+    def _search_clear(self, param):
+        state = self._searches.get(self._key(param.thisObject))
+        if state is not None:
+            state["query"] = ""
+            self._update_suggestions(state)
+
+    def _search_detach(self, param):
+        self._remove_search(self._key(param.thisObject))
+
+    def _search_attach(self, param):
+        pager = param.thisObject
+        parent = self._get(pager, "parent")
+        if parent is None or bool(self._get(parent, "onlySelect")):
+            return
+        state = self._searches.get(self._key(pager))
+        if state is None:
+            state = self._attach_search(pager, parent)
+        state["query"] = str(self._get(pager, "lastSearchString") or "")
+        self._update_suggestions(state)
+
+    def _remove_search(self, key):
+        state = self._searches.pop(key, None)
+        if state is None:
+            return
+        state["pager"].searchContainer.removeOnLayoutChangeListener(state["layout_listener"])
+        state["height"] = 0
+        self._apply_search_padding(state)
+        root = state["root"]
+        root.removeAllViews()
+        parent = root.getParent()
+        if parent is not None:
+            parent.removeView(root)
+
+    def _open_dialog(self, state, account, uid, did):
+        if not self._active or self._uid(account) != uid:
+            return
+        storage = self.Storage.getInstance(account)
+
+        def load():
+            if not self._active or self._uid(account) != uid:
+                return
+            obj, enc_user = self._resolve_dialog(account, did, storage, sync=True)
+
+            def show():
+                if not self._active or self._uid(account) != uid:
+                    return
+                from ui.bulletin import BulletinHelper
+                if obj is None:
+                    BulletinHelper.show_error("Чат больше недоступен на этом устройстве.", state["parent"])
+                    return
+                controller = self.Controller.getInstance(account)
+                args = self.Bundle()
+                if isinstance(obj, self.TLChat):
+                    controller.putChat(obj, True)
+                    args.putLong("chat_id", self._jlong(obj.id))
+                elif isinstance(obj, self.TLEncrypted):
+                    controller.putEncryptedChat(obj, True)
+                    controller.putUser(enc_user, True)
+                    args.putInt("enc_id", int(obj.id))
+                else:
+                    controller.putUser(obj, True)
+                    args.putLong("user_id", self._jlong(obj.id))
+                fragment = self.Chat(args)
+                fragment.setCurrentAccount(account)
+                state["parent"].presentFragment(fragment)
+
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(show)
+
+        # Use the public SDK: direct access to PluginServices is deliberately
+        # forbidden by the fork, even with hooks and trusted access granted.
+        from client_utils import run_on_queue
+        run_on_queue(load, queue="chat_tags_open")
+
+    def create_settings(self):
+        from ui.settings import Header, Text, Divider
+        return [
+            Header("Теги чатов"),
+            Text("Как добавить первый тег", subtext="Профиль чата → ⋮ → Плагины → Добавить / изменить теги. Или нажмите ＋ Добавить теги над кнопками профиля."),
+            Text("Состояние", subtext=getattr(self, "_status", "Плагин выключен")),
+            Divider("Теги хранятся только в настройках плагина на этом устройстве, отдельно для каждого аккаунта."),
+        ]
+
+    def on_plugin_unload(self):
+        self._active = False
+        if getattr(self, "_menu_id", None):
+            self.remove_menu_item(self._menu_id)
+            self._menu_id = None
+        for hook in getattr(self, "_hooks", []):
+            self.unhook_method(hook)
+        self._hooks = []
+
+        def cleanup():
+            for dialog in list(getattr(self, "_dialogs", [])):
+                dialog.dismiss()
+            for key in list(getattr(self, "_profiles", {})):
+                self._remove_profile(key, restore=True)
+            for key in list(getattr(self, "_searches", {})):
+                self._remove_search(key)
+            self._prepared.clear()
+
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(cleanup)

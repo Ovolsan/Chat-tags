@@ -1,0 +1,5 @@
+.reference/
+.tools/
+__pycache__/
+*.pyc
+
