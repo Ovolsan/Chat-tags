@@ -9,7 +9,7 @@ __id__ = "chat_tags"
 __name__ = "Теги чатов"
 __description__ = "Личные теги в профилях и поиск чатов по тегам. Компактные подсказки с раскрытием списка."
 __author__ = "Ovolsan"
-__version__ = "20261009.1"
+__version__ = "20261027.1"
 __icon__ = "msg_hashtag"
 __permissions__ = ["ui", "messages.read", "hooks"]
 

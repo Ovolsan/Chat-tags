@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Теги чатов для exteraLess</title>
+<meta name="description" content="Плагин exteraLess: личные теги для чатов Telegram и поиск чатов по тегам. Возможности, установка, примеры.">
+<meta name="keywords" content="exteraLess plugin, exteraGram plugin, Telegram chat tags, chat labels, tag search, плагин exteraLess, теги чатов, метки чатов, поиск по тегам, организация чатов Telegram">
+<meta property="og:title" content="Теги чатов для exteraLess">
+<meta property="og:description" content="Подпишите любой чат своими словами и находите его по тегам в обычном поиске.">
+<meta property="og:type" content="article">
+<style>
+  :root {
+    --bg: #f6f5f1;
+    --paper: #ffffff;
+    --ink: #1d1d1f;
+    --muted: #6b6b70;
+    --line: #e4e2dc;
+    --accent: #2a7ab0;
+    --accent-soft: #e5f0f7;
+    --chip: #eef0f2;
+    --code: #f1efe9;
+    --mark: #fff2b8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141416;
+      --paper: #1c1c1f;
+      --ink: #ececee;
+      --muted: #9a9aa2;
+      --line: #2e2e33;
+      --accent: #6db3e3;
+      --accent-soft: #1f3140;
+      --chip: #2a2b30;
+      --code: #26262a;
+      --mark: #4a4020;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141416; --paper: #1c1c1f; --ink: #ececee; --muted: #9a9aa2; --line: #2e2e33;
+    --accent: #6db3e3; --accent-soft: #1f3140; --chip: #2a2b30; --code: #26262a; --mark: #4a4020;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 17px/1.6 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  .note {
+    max-width: 760px;
+    margin: 32px auto;
+    padding: 40px 48px 48px;
+    background: var(--paper);
+    border: 1px solid var(--line);
+  }
+  .meta { color: var(--muted); font-size: 14px; margin: 0 0 8px; }
+  h1 { font-size: 34px; line-height: 1.2; margin: 0 0 12px; letter-spacing: -0.01em; }
+  h2 { font-size: 23px; margin: 40px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+  h3 { font-size: 18px; margin: 24px 0 8px; }
+  p, ul, ol { margin: 0 0 14px; }
+  li { margin-bottom: 6px; }
+  a { color: var(--accent); }
+  code {
+    font: 15px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    background: var(--code);
+    padding: 1px 5px;
+  }
+  .lead { font-size: 19px; color: var(--muted); margin-bottom: 20px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0 8px; }
+  .btn {
+    display: inline-block; padding: 10px 18px; text-decoration: none; font-weight: 600;
+    border: 1px solid var(--accent); color: var(--accent);
+  }
+  .btn.primary { background: var(--accent); color: var(--paper); }
+  .callout {
+    background: var(--accent-soft);
+    padding: 14px 18px;
+    margin: 18px 0;
+    border-left: 3px solid var(--accent);
+  }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 18px; font-size: 15px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+
+  /* Phone mock-ups */
+  .mocks { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 18px 0; }
+  figure { margin: 0; }
+  figcaption { color: var(--muted); font-size: 14px; margin-top: 8px; }
+  .phone { border: 1px solid var(--line); background: var(--bg); font-size: 14px; overflow: hidden; }
+  .phone-head { background: var(--accent); color: #fff; padding: 18px 16px 14px; text-align: center; }
+  .avatar { width: 56px; height: 56px; border-radius: 50%; background: rgba(255,255,255,.35); margin: 0 auto 8px; }
+  .name { font-weight: 600; font-size: 16px; }
+  .status { opacity: .8; font-size: 13px; }
+  .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 14px; }
+  .actions span { background: rgba(255,255,255,.18); padding: 8px 0; font-size: 12px; }
+  .tags { background: var(--paper); padding: 10px 16px 12px; color: var(--ink); text-align: left; border-bottom: 1px solid var(--line); }
+  .tags.empty { color: var(--accent); }
+  .list-row { padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--paper); color: var(--muted); }
+  .search-bar { background: var(--paper); padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .search-bar b { color: var(--ink); }
+  .chips { background: var(--paper); padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }
+  .chip { background: var(--chip); color: var(--accent); padding: 6px 12px; white-space: nowrap; }
+  .chip.more { background: transparent; border: 1px solid var(--line); }
+  .editor { background: var(--paper); padding: 14px 16px; }
+  .editor .title { font-weight: 600; margin-bottom: 10px; }
+  .editor pre {
+    margin: 0 0 10px; padding: 10px; background: var(--code);
+    font: 14px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+  }
+  .editor .hint { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .editor .save { text-align: right; color: var(--accent); font-weight: 600; }
+  mark { background: var(--mark); color: inherit; padding: 0 2px; }
+  footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+
+  @media (max-width: 640px) {
+    body { font-size: 16px; }
+    .note { margin: 0; padding: 24px 16px 32px; border: 0; }
+    h1 { font-size: 28px; }
+  }
+</style>
+</head>
+<body>
+<article class="note">
+  <p class="meta">Заметка · плагин для exteraLess · версия 20261027.1 · лицензия GPL-3.0</p>
+  <h1>Теги чатов: находите нужный чат по своим словам</h1>
+  <p class="lead">Плагин для exteraLess, который позволяет подписать любой чат Telegram личными тегами и находить его по этим тегам в обычном поиске.</p>
+
+  <div class="buttons">
+    <a class="btn primary" href="https://github.com/Ovolsan/Chat-tags/releases/latest">Скачать плагин</a>
+    <a class="btn" href="https://github.com/Ovolsan/Chat-tags">Исходный код на GitHub</a>
+  </div>
+
+  <h2>Зачем это нужно</h2>
+  <p>Через год активного использования Telegram в списке легко оказывается несколько сотен чатов. Группа соседей по даче называется «СНТ Берёзка 2019», бухгалтер записан по имени и фамилии, а канал с полезными советами вы помните только по теме. Чтобы найти такой чат, приходится вспоминать точное название или долго листать список.</p>
+  <p>Папки помогают, но один чат часто относится сразу к нескольким темам, а папок мало. Теги решают эту задачу: вы подписываете чат так, как сами о нём думаете, и находите его по любому из этих слов.</p>
+  <div class="callout">Теги хранятся только на вашем телефоне. Плагин не выполняет сетевых запросов, ничего не отправляет и не читает содержимое сообщений. Другие участники чата тегов не видят.</div>
+
+  <h2>Что умеет плагин</h2>
+  <ul>
+    <li><b>Теги для любого чата</b>: личные переписки, боты, группы, каналы, секретные чаты, форумы.</li>
+    <li><b>Блок тегов в профиле</b> прямо под кнопками «Чат», «Звук», «Звонок», «Подарок».</li>
+    <li><b>Удобный редактор</b> с подсказками из тегов, которые вы уже использовали.</li>
+    <li><b>Поиск по тегам</b> в общем поиске: компактные кнопки с найденными чатами над результатами.</li>
+    <li><b>Найденные чаты попадают и в обычную выдачу</b>, стандартный поиск работает как прежде.</li>
+    <li><b>Отдельные теги для каждого аккаунта</b>, если вы пользуетесь несколькими.</li>
+  </ul>
+
+  <div class="mocks">
+    <figure>
+      <div class="phone">
+        <div class="phone-head">
+          <div class="avatar"></div>
+          <div class="name">СНТ Берёзка 2019</div>
+          <div class="status">148 участников</div>
+          <div class="actions"><span>Чат</span><span>Звук</span><span>Звонок</span><span>Подарок</span></div>
+        </div>
+        <div class="tags">#дача · #соседи · #вода · #взносы</div>
+        <div class="list-row">Описание</div>
+        <div class="list-row">Участники</div>
+      </div>
+      <figcaption>Профиль чата с тегами. Нажатие на строку открывает редактор.</figcaption>
+    </figure>
+    <figure>
+      <div class="phone">
+        <div class="phone-head">
+          <div class="avatar"></div>
+          <div class="name">Иван Петров</div>
+          <div class="status">был(а) недавно</div>
+          <div class="actions"><span>Чат</span><span>Звук</span><span>Звонок</span><span>Подарок</span></div>
+        </div>
+        <div class="tags empty">＋ Добавить тег</div>
+        <div class="list-row">Телефон</div>
+        <div class="list-row">Имя пользователя</div>
+      </div>
+      <figcaption>Если тегов ещё нет, под кнопками видна подсказка «＋ Добавить тег».</figcaption>
+    </figure>
+  </div>
+
+  <h2>Как установить</h2>
+  <ol>
+    <li>Скачайте файл <code>chat_tags.plugin</code> со <a href="https://github.com/Ovolsan/Chat-tags/releases/latest">страницы релиза</a>.</li>
+    <li>Отправьте его себе в «Избранное» и откройте в exteraLess, затем нажмите «Установить».</li>
+    <li>В настройках доступа плагина выберите уровень <b>«Доверенный»</b> и разрешите <code>hooks</code> и <code>messages.read</code>. Они нужны, чтобы встроить блок в профиль и добавить результаты в поиск.</li>
+    <li>Включите плагин и заново откройте любой профиль.</li>
+  </ol>
+  <p>Обновление ставится так же, поверх старой версии. Удалять предыдущую не нужно, сохранённые теги останутся.</p>
+
+  <h2>Как добавить теги</h2>
+  <p>Откройте профиль чата и нажмите <b>«＋ Добавить тег»</b> под кнопками. Если теги уже есть, нажмите на их список. Второй путь, который работает всегда: <b>профиль → ⋮ → Плагины → Добавить / изменить теги</b>.</p>
+
+  <div class="mocks">
+    <figure>
+      <div class="phone">
+        <div class="editor">
+          <div class="title">Теги: СНТ Берёзка 2019</div>
+<pre>дача
+соседи
+вода, взносы
+вз</pre>
+          <div class="hint"><span class="chip">взносы 2026</span><span class="chip">взносы 2025</span></div>
+          <div class="save">СОХРАНИТЬ</div>
+        </div>
+      </div>
+      <figcaption>Один тег на строку или через запятую. Ниже — подсказки из уже сохранённых тегов.</figcaption>
+    </figure>
+  </div>
+
+  <h3>Правила записи</h3>
+  <ul>
+    <li>Один тег — одна строка. Запятая и точка с запятой тоже разделяют теги: <code>вода, взносы</code> — это два тега.</li>
+    <li>Внутри тега можно писать фразу: <code>поставщик плитки</code> — один тег.</li>
+    <li>Регистр, лишние пробелы и решётка в начале не важны: <code>#Дача</code>, <code>дача</code> и <code>ДАЧА</code> — один и тот же тег.</li>
+    <li>Буквы «ё» и «е» не различаются: <code>отчёты</code> найдётся по запросу <code>отчеты</code>.</li>
+    <li>Русские и английские слова — разные теги: <code>работа</code> не найдётся по запросу <code>work</code>.</li>
+    <li>До 64 тегов на чат и до 128 символов в одном теге.</li>
+    <li>Чтобы удалить тег, сотрите его строку. Пустой список удаляет все теги чата.</li>
+  </ul>
+
+  <h2>Как искать</h2>
+  <p>Начните вводить запрос в общем поиске чатов. Над обычными результатами появятся кнопки с названиями чатов, у которых нашёлся подходящий тег. Нажатие на кнопку сразу открывает чат.</p>
+
+  <div class="mocks">
+    <figure>
+      <div class="phone">
+        <div class="search-bar">🔍 <b>дач</b></div>
+        <div class="chips">
+          <span class="chip">СНТ Берёзка 2019</span>
+          <span class="chip">Сосед Михаил</span>
+          <span class="chip">Дрова и уголь</span>
+          <span class="chip">Электрик Олег</span>
+          <span class="chip">Водопровод СНТ</span>
+          <span class="chip more">Показать все (9)</span>
+        </div>
+        <div class="list-row">Чаты и контакты…</div>
+        <div class="list-row">Сообщения…</div>
+      </div>
+      <figcaption>Две строки кнопок. Если совпадений больше, «Показать все (N)» раскрывает список, «Свернуть» возвращает две строки.</figcaption>
+    </figure>
+  </div>
+
+  <h3>Примеры запросов</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Чат</th><th>Теги</th><th>Запрос</th><th>Почему найдётся</th></tr></thead>
+    <tbody>
+      <tr><td>СНТ Берёзка 2019</td><td><code>дача</code>, <code>соседи</code>, <code>вода</code></td><td><code>дач</code></td><td>Тег <code><mark>дач</mark>а</code> начинается с запроса</td></tr>
+      <tr><td>Иван Петров</td><td><code>работа</code>, <code>бухгалтерия</code></td><td><code>галтер</code></td><td>Запрос — часть тега: <code>бух<mark>галтер</mark>ия</code></td></tr>
+      <tr><td>Бот доставки</td><td><code>доставка пиццы</code></td><td><code>пицц дост</code></td><td>Все слова запроса есть в одном теге, порядок не важен</td></tr>
+      <tr><td>Канал о рыбалке</td><td><code>#Рыбалка</code></td><td><code>рыбалка</code></td><td>Регистр и решётка не учитываются</td></tr>
+      <tr><td>Иван Петров</td><td><code>отчёты</code></td><td><code>отчеты</code></td><td>«ё» и «е» считаются одной буквой</td></tr>
+      <tr><td>Канал о рыбалке</td><td><code>рыбалка</code></td><td><code>fishing</code></td><td><b>Не найдётся</b>: перевода нет, добавьте английский тег отдельно</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Чем точнее совпадение, тем выше чат в списке: сначала полное совпадение с тегом, затем теги, начинающиеся с запроса, затем остальные.</p>
+
+  <h2>Идеи для тегов</h2>
+  <ul>
+    <li><b>По сферам жизни</b>: <code>работа</code>, <code>семья</code>, <code>дача</code>, <code>учёба</code>, <code>здоровье</code>.</li>
+    <li><b>По роли человека</b>: <code>бухгалтер</code>, <code>сантехник</code>, <code>репетитор</code>, <code>поставщик плитки</code>.</li>
+    <li><b>По проекту</b>: <code>ремонт кухни</code>, <code>переезд 2026</code>, <code>свадьба</code>.</li>
+    <li><b>По пользе</b>: <code>рецепты</code>, <code>скидки</code>, <code>полезные боты</code>, <code>прочитать позже</code>.</li>
+  </ul>
+
+  <h2>Где хранятся данные</h2>
+  <p>Теги лежат в настройках плагина на телефоне, отдельно для каждого аккаунта (по его Telegram ID). Между устройствами они не синхронизируются. Если удалить плагин или очистить данные приложения, теги могут пропасть.</p>
+
+  <h2>Лицензия</h2>
+  <p>Плагин распространяется по лицензии <b>GNU GPL v3.0</b>. Его можно свободно использовать, изучать, изменять и распространять; изменённые версии должны оставаться открытыми на тех же условиях. Полный текст лицензии — в <a href="https://github.com/Ovolsan/Chat-tags/blob/main/LICENSE">репозитории</a>.</p>
+
+  <footer>
+    <a href="https://github.com/Ovolsan/Chat-tags">github.com/Ovolsan/Chat-tags</a> · автор: Ovolsan<br>
+    Ключевые слова: exteraLess plugin, exteraGram plugin, Telegram chat tags, chat labels, tag search · плагин exteraLess, теги чатов, метки чатов, поиск по тегам, организация чатов Telegram.
+  </footer>
+</article>
+</body>
+</html>
