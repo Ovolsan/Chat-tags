@@ -24,6 +24,8 @@ from base_plugin import BasePlugin, MenuItemData, MenuItemType
 MAX_TAGS = 64
 MAX_TAG_LENGTH = 128
 PROFILE_HEIGHT_DP = 66
+ACTIONS_HEIGHT_DP = 74
+MUSIC_HEIGHT_DP = 25
 SUGGESTION_ROW_DP = 40
 MAX_SUGGESTIONS = 2
 SEARCH_PREVIEW_ROWS = 2
@@ -501,7 +503,7 @@ class ChatTagsPlugin(BasePlugin):
     def _render_profile(self, state):
         entry = self._index.get(state["uid"], state["did"])
         state["tags"].setText(" · ".join("#" + tag for tag in entry["tags"])
-                              if entry["tags"] else "＋ Добавить")
+                              if entry["tags"] else "＋ Добавить тег")
         state["tags"].setTextColor(self.Theme.getColor(self.Theme.key_windowBackgroundWhiteBlackText))
         state["root"].setBackground(self._background(self.Theme.getColor(self.Theme.key_windowBackgroundWhite)))
 
@@ -509,29 +511,43 @@ class ChatTagsPlugin(BasePlugin):
         state = self._profiles.get(self._key(param.thisObject))
         if state is not None:
             profile = state["profile"]
-            # The gallery-opening branch uses the image width directly rather
-            # than getActionsExtraHeight. Reserve the tag slot in that branch
-            # as well; the original method has just reset this translation.
-            if (bool(self._get(profile, "openAnimationInProgress"))
-                    and int(self._get(profile, "playProfileAnimation") or 0) == 2):
-                actions = self._get(profile, "actionsView")
-                if actions is not None:
-                    actions.setTranslationY(float(actions.getTranslationY()) + self._dp(PROFILE_HEIGHT_DP))
+            actions = self._get(profile, "actionsView")
+            # Outside the gallery-opening branch the buttons sit at the header
+            # bottom. Lift them so the reserved tag slot ends up below them.
+            if actions is not None and not (bool(self._get(profile, "openAnimationInProgress"))
+                                            and int(self._get(profile, "playProfileAnimation") or 0) == 2):
+                bottom = self._header_bottom(profile) - self._music_height(profile) - self._dp(PROFILE_HEIGHT_DP)
+                height = min(self._dp(ACTIONS_HEIGHT_DP), bottom - self._action_bar_top(profile))
+                actions.updatePosition(float(bottom - height), float(height))
             self._position_profile(state)
 
-    def _position_profile(self, state):
-        profile, root = state["profile"], state["root"]
-        actions = self._get(profile, "actionsView")
+    def _action_bar_top(self, profile):
         action_bar = profile.getActionBar()
         top = int(action_bar.getCurrentActionBarHeight())
         if action_bar.getOccupyStatusBar():
             top += int(self.AU.statusBarHeight)
+        return top
+
+    def _header_bottom(self, profile):
+        return float(self._get(profile, "extraHeight") or 0) + self._action_bar_top(profile)
+
+    def _music_height(self, profile):
+        return self._dp(MUSIC_HEIGHT_DP) if bool(self._get(profile, "hasMusic")) else 0
+
+    def _position_profile(self, state):
+        profile, root = state["profile"], state["root"]
+        actions = self._get(profile, "actionsView")
+        top = self._action_bar_top(profile)
         height = self._dp(PROFILE_HEIGHT_DP)
         if actions is not None:
-            y = float(actions.getTranslationY()) - height
+            if (bool(self._get(profile, "openAnimationInProgress"))
+                    and int(self._get(profile, "playProfileAnimation") or 0) == 2):
+                y = float(actions.getTranslationY()) + self._dp(ACTIONS_HEIGHT_DP) + self._music_height(profile)
+            else:
+                y = self._header_bottom(profile) - height
             alpha = float(actions.getAlpha())
         else:
-            y = float(self._get(profile, "extraHeight") or 0) + top - height
+            y = self._header_bottom(profile) - height
             alpha = 1.0
         root.setTranslationY(float(y))
         # During collapse the block disappears at the action bar edge instead
@@ -990,7 +1006,7 @@ class ChatTagsPlugin(BasePlugin):
         from ui.settings import Header, Text, Divider
         return [
             Header("Теги чатов"),
-            Text("Как добавить первый тег", subtext="Профиль чата → ⋮ → Плагины → Добавить / изменить теги. Или нажмите ＋ Добавить над кнопками профиля."),
+            Text("Как добавить первый тег", subtext="Профиль чата → ⋮ → Плагины → Добавить / изменить теги. Или нажмите ＋ Добавить тег под кнопками профиля."),
             Text("Состояние", subtext=getattr(self, "_status", "Плагин выключен")),
             Divider("Теги хранятся только в настройках плагина на этом устройстве, отдельно для каждого аккаунта."),
         ]
