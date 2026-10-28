@@ -125,8 +125,19 @@ class IndexTests(unittest.TestCase):
 
 
 class JavaList(list):
+    """java.util.ArrayList as the client exposes it: get/size, no iteration."""
+
     def add(self, value):
         self.append(value)
+
+    def get(self, index):
+        return list.__getitem__(self, index)
+
+    def size(self):
+        return list.__len__(self)
+
+    def __iter__(self):
+        raise TypeError("'ArrayList' object is not iterable")
 
 
 class SearchLayoutTests(unittest.TestCase):
@@ -355,6 +366,7 @@ class HookBehaviorTests(unittest.TestCase):
         results = JavaList(results or [])
         names = JavaList(names or [])
         enc_users = JavaList()
+        allowed = JavaList(allowed) if allowed is not None else None
         param = HookParam(self.storage, [dialog_type, query, results, names, enc_users, allowed, -1])
         self.instance._local_search(param)
         return results, names, enc_users
@@ -375,8 +387,8 @@ class HookBehaviorTests(unittest.TestCase):
         self.instance._index.set(100, -8, "Второй", ["рыбалка"])
         results, names, _ = self.search()
         self.assertEqual(len(results), len(names))
-        self.assertEqual([(obj.title, name) for obj, name in zip(results, names)],
-                         [(name, name) for name in names])
+        self.assertEqual([(obj.title, name) for obj, name in zip(list.__iter__(results), list.__iter__(names))],
+                         [(name, name) for name in list.__iter__(names)])
 
     def test_peer_pickers_and_allowlists_are_respected(self):
         self.assertEqual(self.search(dialog_type=15)[0], [])
@@ -476,17 +488,41 @@ class HookBehaviorTests(unittest.TestCase):
             raise RuntimeError("hooks отказ")
 
         self.instance._register_hooks = deny_hooks
-        self.instance.on_plugin_load()
+        queued = []
+        client_utils = types.ModuleType("client_utils")
+        client_utils.run_on_queue = queued.append
+        with patch.dict(sys.modules, {"client_utils": client_utils}):
+            self.instance.on_plugin_load()
+        # Startup work is queued off the main thread.
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(registered, [])
+        queued[0]()
         self.assertTrue(self.instance._active)
         self.assertFalse(self.instance._hooks_ready)
         self.assertEqual(len(registered), 1)
         self.assertEqual(registered[0].menu_type, "PROFILE_ACTION_MENU")
-        self.assertIn("hooks отказ", self.instance._status)
+        self.assertTrue(self.instance._status_error)
+        self.assertIn("hooks отказ", self.instance._status_detail)
         opened = []
         self.instance._edit_tags = opened.append
         registered[0].on_click({"fragment": types.SimpleNamespace(
             getCurrentAccount=lambda: 0, getDialogId=lambda: -7, getParentActivity=lambda: "context")})
         self.assertEqual(len(opened), 1)
+
+    def test_unload_before_background_start_skips_registration(self):
+        self.instance.get_setting = lambda key, default: default
+        started = []
+        self.instance._init_android = lambda: started.append("init")
+        queued = []
+        client_utils = types.ModuleType("client_utils")
+        client_utils.run_on_queue = queued.append
+        android_utils = types.ModuleType("android_utils")
+        android_utils.run_on_ui_thread = lambda fn: fn()
+        with patch.dict(sys.modules, {"client_utils": client_utils, "android_utils": android_utils}):
+            self.instance.on_plugin_load()
+            self.instance.on_plugin_unload()
+            queued[0]()
+        self.assertEqual(started, [])
 
     def test_android_initialization_respects_denied_engine_classes(self):
         requested = []

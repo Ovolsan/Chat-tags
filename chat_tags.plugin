@@ -9,7 +9,7 @@ __id__ = "chat_tags"
 __name__ = "Теги чатов"
 __description__ = "Личные теги в профилях и поиск чатов по тегам. Компактные подсказки с раскрытием списка."
 __author__ = "Ovolsan"
-__version__ = "20261027.1"
+__version__ = "20261028.6"
 __icon__ = "msg_hashtag"
 __permissions__ = ["ui", "messages.read", "hooks"]
 
@@ -85,6 +85,18 @@ def replace_last_tag(text, suggestion):
 
 def encrypted_dialog_id(chat_id):
     return 0x4000000000000000 | (int(chat_id) & 0xffffffff)
+
+
+def short_error(error):
+    """First line of an exception: Java errors carry a full stack trace."""
+    try:  # InvocationTargetException wraps the helper's real error
+        while error.getCause() is not None:
+            error = error.getCause()
+        text = str(error.toString())
+    except Exception:
+        text = str(error)
+    lines = text.strip().splitlines()
+    return lines[0].strip() if lines else type(error).__name__
 
 
 def pack_chat_rows(widths, available_width, gap):
@@ -168,6 +180,10 @@ class TagIndex:
     def get(self, uid, did):
         return self.account(uid).get(str(int(did)), {"title": "Чат", "tags": []})
 
+    def accounts(self):
+        with self._lock:
+            return [int(uid) for uid in self._data["accounts"]]
+
     def set(self, uid, did, title, tags):
         uid, did = str(int(uid)), str(int(did))
         if int(uid) <= 0 or int(did) == 0:
@@ -212,7 +228,30 @@ class TagIndex:
         return [item[2] for item in candidates[:limit]]
 
 
+class _NativeBridge:
+    """Calls static methods of the embedded Java helper by name."""
+
+    def __init__(self, cls):
+        # jint/jlong keep the primitive type when Chaquopy boxes Object varargs.
+        from java import jboolean, jint, jlong
+        boxes = {"int": jint, "long": jlong, "boolean": jboolean}
+        self._methods = {}
+        for method in cls.getDeclaredMethods():
+            types = [boxes.get(str(t.getName())) for t in method.getParameterTypes()]
+            self._methods[str(method.getName())] = (method, types)
+
+    def __getattr__(self, name):
+        method, boxes = self._methods[name]
+
+        def call(*args):
+            return method.invoke(None, *[box(value) if box else value for box, value in zip(boxes, args)])
+        setattr(self, name, call)
+        return call
+
+
 class ChatTagsPlugin(BasePlugin):
+    _native = None  # embedded Java helper, set once it is installed
+
     def on_plugin_load(self):
         self._active = True
         self._hooks = []
@@ -223,36 +262,55 @@ class ChatTagsPlugin(BasePlugin):
         self._errors = set()
         self._menu_id = None
         self._hooks_ready = False
-        self._status = "Запуск"
+        self._native = None
+        self._native_note = ""
+        self._stopped = False
+        self._start_lock = threading.Lock()
+        self._set_status("Запускается…")
         try:
             self._index = TagIndex(self.get_setting(STORE_KEY, None))
         except ValueError as error:
             self._active = False
-            self._status = str(error) + " Сохранение отключено, данные оставлены в настройках."
-            self.log(self._status)
+            self._set_status("Сохранённые теги не прочитаны",
+                             str(error) + " Сохранение отключено, данные оставлены в настройках.", error=True)
+            self.log(self._status_detail)
             return
-        try:
-            self._init_android()
-            self._register_profile_menu()
-        except Exception as error:
-            self._active = False
-            self._status = "Не подключено: " + str(error)
-            self.log(self._status)
-            return
-        try:
-            self._register_hooks()
-            self._hooks_ready = True
-            self._status = "Профили и поиск подключены; редактор также доступен в меню профиля"
-            from android_utils import run_on_ui_thread
-            run_on_ui_thread(self._attach_current_profile)
-        except Exception as error:
-            for hook in self._hooks:
-                self.unhook_method(hook)
-            self._hooks.clear()
-            # The public profile-menu API works independently of Java hooks.
-            # Keep first-tag creation available when embedding is unavailable.
-            self._status = "Редактор доступен через ⋮ → Плагины → Добавить / изменить теги. Встраивание отключено: " + str(error)
-            self.log(self._status)
+        # Class lookups, hook registration and DEX loading stay off the main
+        # thread so the client does not freeze while plugins start.
+        from client_utils import run_on_queue
+        run_on_queue(self._start_background)
+
+    def _set_status(self, title, detail="", error=False):
+        self._status_title, self._status_detail, self._status_error = title, detail, error
+
+    def _start_background(self):
+        with self._start_lock:
+            if self._stopped:
+                return
+            try:
+                self._init_android()
+                self._register_profile_menu()
+            except Exception as error:
+                self._active = False
+                self._set_status("Плагин не подключился", short_error(error), error=True)
+                self.log("Не подключено: " + str(error))
+                return
+            try:
+                self._register_hooks()
+                self._hooks_ready = True
+                self._set_status("Работает", self._native_note)
+            except Exception as error:
+                for hook in self._hooks:
+                    self.unhook_method(hook)
+                self._hooks.clear()
+                self._close_native()
+                # The public profile-menu API works independently of Java hooks.
+                self._set_status("Работает только редактор в меню профиля",
+                                 "Блок в профиле и поиск отключены: " + short_error(error), error=True)
+                self.log("Встраивание отключено: " + str(error))
+                return
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(self._attach_current_profile)
 
     def _init_android(self):
         from java import jclass, dynamic_proxy, jlong, jint
@@ -328,7 +386,8 @@ class ChatTagsPlugin(BasePlugin):
                 if label not in self._errors:
                     self._errors.add(label)
                     self.log(label + ": " + str(error))
-                    self._status = "Ошибка " + label + ": " + str(error) + ". Редактор доступен в меню профиля."
+                    self._set_status("Ошибка в " + label, short_error(error)
+                                     + ". Редактор тегов в меню профиля продолжает работать.", error=True)
         return guarded
 
     def _register_profile_menu(self):
@@ -378,18 +437,67 @@ class ChatTagsPlugin(BasePlugin):
     def _register_hooks(self):
         from java import jclass
         self.Storage = jclass("org.telegram.messenger.MessagesStorage")
-        self._hook(self.Profile, "getActionsExtraHeight", 1, after=self._profile_height)
+        # The first SDK hook checks the permission and initializes the engine
+        # before the Java helper calls XposedBridge itself.
         self._hook(self.Profile, "createView", 1,
                    before=self._before_profile_create, after=self._after_profile_create)
-        self._hook(self.Profile, "updateActionsPosition", 0, after=self._profile_position)
         self._hook(self.Profile, "onResume", 0, after=self._profile_resume)
         self._hook(self.Profile, "onFragmentDestroy", 0, before=self._profile_destroy)
-        self._hook(self.Storage, "localSearch", 7, after=self._local_search)
         self._hook(self.Pager, "onTextChanged", 1, after=self._search_changed)
-        self._hook(self.Pager, "setPagesPadding", 3, after=self._search_padding)
         self._hook(self.Pager, "clear", 0, after=self._search_clear)
         self._hook(self.Pager, "onAttachedToWindow", 0, after=self._search_attach)
         self._hook(self.Pager, "onDetachedFromWindow", 0, after=self._search_detach)
+        if not self._load_native():
+            self._hook(self.Profile, "getActionsExtraHeight", 1, after=self._profile_height)
+            self._hook(self.Profile, "updateActionsPosition", 0, after=self._profile_position)
+            self._hook(self.Storage, "localSearch", 7, after=self._local_search)
+            self._hook(self.Pager, "setPagesPadding", 3, after=self._search_padding)
+
+    def _load_native(self):
+        """Profile scrolling, localSearch and list padding run in the embedded DEX."""
+        from java import jclass
+        try:
+            raw = jclass("android.util.Base64").decode("".join(_NATIVE_DEX), 0)
+            buffer = jclass("java.nio.ByteBuffer").wrap(raw)
+            loader = jclass("dalvik.system.InMemoryDexClassLoader")(
+                buffer, self.Profile.getClass().getClassLoader())
+            native = _NativeBridge(loader.loadClass("chat.tags.TagsBridge"))
+            self._native_ids = [str(value) for value in native.install(
+                self.Profile.getClass(), self.Storage.getClass(), self.Pager.getClass(),
+                str(getattr(self, "id", None) or __id__), self._dp(PROFILE_HEIGHT_DP),
+                self._dp(ACTIONS_HEIGHT_DP), self._dp(MUSIC_HEIGHT_DP))]
+            self._native, self._native_loader = native, loader
+            for uid in self._index.accounts():
+                self._push_index(uid)
+            self._native_note = "Быстрый режим: прокрутка профиля и поиск обрабатываются Java-помощником."
+            return True
+        except Exception as error:
+            self._close_native()
+            self._native_note = ("Режим совместимости: Java-помощник не загрузился ("
+                                 + short_error(error) + ").")
+            self.log(self._native_note)
+            return False
+
+    def _close_native(self):
+        native, self._native = getattr(self, "_native", None), None
+        self._native_loader = None
+        if native is not None:
+            try:
+                native.close()
+            except Exception:
+                pass
+
+    def _push_index(self, uid):
+        if self._native is None:
+            return
+        from java import jarray, jlong
+        entries = sorted(self._index.account(uid).items())
+        self._native.setIndex(
+            int(uid),
+            jarray(jlong)([int(did) for did, _ in entries]),
+            jarray(self.JString)([entry["title"] for _, entry in entries]),
+            jarray(self.JString)(["\n".join(normalized(tag) for tag in entry["tags"])
+                                  for _, entry in entries]))
 
     def _profile_height(self, param):
         if int(param.thisObject.getDialogId()) != 0:
@@ -478,6 +586,8 @@ class ChatTagsPlugin(BasePlugin):
         self._prepared.add(key)
         self._render_profile(state)
         parent.requestLayout()
+        if self._native is not None:
+            self._native.attachProfile(profile, root)
         self._position_profile(state)
 
     def _java_float(self, value):
@@ -535,6 +645,9 @@ class ChatTagsPlugin(BasePlugin):
         return self._dp(MUSIC_HEIGHT_DP) if bool(self._get(profile, "hasMusic")) else 0
 
     def _position_profile(self, state):
+        if self._native is not None:
+            self._native.reposition(state["profile"])
+            return
         profile, root = state["profile"], state["root"]
         actions = self._get(profile, "actionsView")
         top = self._action_bar_top(profile)
@@ -561,6 +674,8 @@ class ChatTagsPlugin(BasePlugin):
         if state is None:
             return
         root, profile = state["root"], state["profile"]
+        if self._native is not None:
+            self._native.detachProfile(profile)
         root.setOnClickListener(None)
         parent = root.getParent()
         if parent is not None:
@@ -583,6 +698,7 @@ class ChatTagsPlugin(BasePlugin):
         if self.get_setting(STORE_KEY, None) != payload:
             raise ValueError("Не удалось сохранить теги. Попробуйте снова.")
         self._index = updated
+        self._push_index(state["uid"])
         for profile in self._profiles.values():
             if profile["uid"] == state["uid"] and profile["did"] == state["did"]:
                 self._render_profile(profile)
@@ -730,8 +846,10 @@ class ChatTagsPlugin(BasePlugin):
         if not matches:
             return
         allowed = param.args[5]
-        allowed_ids = {int(v) for v in allowed} if allowed is not None else None
-        existing = {self._object_id(obj) for obj in results}
+        # Java lists are not iterable from plugin code in this client.
+        allowed_ids = ({int(allowed.get(i)) for i in range(int(allowed.size()))}
+                       if allowed is not None else None)
+        existing = {self._object_id(results.get(i)) for i in range(int(results.size()))}
         # Append pairs together so ProfileSearchCell receives aligned arrays.
         for match in matches:
             did = match["did"]
@@ -911,6 +1029,9 @@ class ChatTagsPlugin(BasePlugin):
 
     def _apply_search_padding(self, state):
         pager, root, height = state["pager"], state["root"], state["height"]
+        if self._native is not None:
+            self._native.setSearch(pager, root, int(height))
+            return
         top = int(self._get(pager, "pagesPaddingTop") or 0)
         bottom = int(self._get(pager, "pagesPaddingBottom") or 0)
         view = pager.searchListView
@@ -955,6 +1076,8 @@ class ChatTagsPlugin(BasePlugin):
         state["pager"].searchContainer.removeOnLayoutChangeListener(state["layout_listener"])
         state["height"] = 0
         self._apply_search_padding(state)
+        if self._native is not None:
+            self._native.detachSearch(state["pager"])
         root = state["root"]
         root.removeAllViews()
         parent = root.getParent()
@@ -1004,15 +1127,36 @@ class ChatTagsPlugin(BasePlugin):
 
     def create_settings(self):
         from ui.settings import Header, Text, Divider
-        return [
-            Header("Теги чатов"),
-            Text("Как добавить первый тег", subtext="Профиль чата → ⋮ → Плагины → Добавить / изменить теги. Или нажмите ＋ Добавить тег под кнопками профиля."),
-            Text("Состояние", subtext=getattr(self, "_status", "Плагин выключен")),
-            Divider("Теги хранятся только в настройках плагина на этом устройстве, отдельно для каждого аккаунта."),
+        error = getattr(self, "_status_error", False)
+        items = [
+            Header("Состояние"),
+            Text(getattr(self, "_status_title", "Плагин выключен"),
+                 icon="msg_info" if error else "msg_check", red=error),
         ]
+        detail = getattr(self, "_status_detail", "")
+        native_error = self._native.lastError() if self._native is not None else None
+        if native_error:
+            detail = (detail + "\n\n" if detail else "") + "Ошибка Java-помощника: " + str(native_error)
+        if detail:
+            items.append(Divider(detail))
+        items += [
+            Header("Как добавить тег"),
+            Divider("Откройте профиль чата и нажмите «＋ Добавить тег» под кнопками «Чат», «Звук», «Звонок». "
+                    "Если теги уже есть, нажмите на их список.\n\n"
+                    "Второй способ: профиль чата → ⋮ → Плагины → Добавить / изменить теги."),
+            Header("Как искать"),
+            Divider("Начните вводить тег в общем поиске чатов. Найденные чаты появятся кнопками над результатами "
+                    "и в обычной выдаче. Регистр, «ё» и порядок слов не важны."),
+            Divider("Теги хранятся только на этом устройстве, отдельно для каждого аккаунта."),
+        ]
+        return items
 
     def on_plugin_unload(self):
         self._active = False
+        lock = getattr(self, "_start_lock", None)
+        if lock is not None:
+            with lock:  # waits for a background start in progress
+                self._stopped = True
         if getattr(self, "_menu_id", None):
             self.remove_menu_item(self._menu_id)
             self._menu_id = None
@@ -1021,6 +1165,7 @@ class ChatTagsPlugin(BasePlugin):
         self._hooks = []
 
         def cleanup():
+            self._close_native()
             for dialog in list(getattr(self, "_dialogs", [])):
                 dialog.dismiss()
             for key in list(getattr(self, "_profiles", {})):
@@ -1031,3 +1176,255 @@ class ChatTagsPlugin(BasePlugin):
 
         from android_utils import run_on_ui_thread
         run_on_ui_thread(cleanup)
+
+
+# Built from native/src/chat/tags/TagsBridge.java by native/build.ps1; no third-party code.
+_NATIVE_DEX = (
+    "ZGV4CjAzOAAFemC8xMSGGT9NkfcygSVP9LV9rgEQOCEsSAAAcAAAAHhWNBIAAAAAAAAAAFxHAABFAQAAcAAAAEUAAACEBQAAVAAA"
+    "AJgGAAAoAAAAiAoAAJUAAADICwAABgAAAHAQAAD8NgAAMBEAACIwAAAkMAAAJzAAACowAAAtMAAAMDAAADQwAAA4MAAAOzAAAD8w"
+    "AABDMAAASDAAAE4wAABVMAAAWzAAAF4wAABhMAAAazAAAHMwAAB3MAAAizAAAI4wAACSMAAAnDAAAKYwAAC6MAAAwTAAAMQwAADJ"
+    "MAAA0TAAAOAwAADjMAAA5zAAAOswAADvMAAA9jAAAPswAAD/MAAABDEAAAcxAAALMQAADjEAABIxAAAXMQAAGzEAAB8xAAAjMQAA"
+    "KDEAACwxAAAxMQAANzEAAEExAABHMQAASzEAAGAxAACHMQAAtDEAAM4xAADvMQAADTIAACsyAABKMgAAYjIAAIYyAACmMgAAyTIA"
+    "AOgyAAAEMwAAPDMAAGszAACTMwAAujMAAM8zAADpMwAAADQAABM0AAAmNAAAPzQAAGM0AAB3NAAAjjQAAKE0AADENAAA2TQAAPM0"
+    "AAAFNQAAFzUAADk1AABcNQAAcDUAAIQ1AACYNQAAszUAAMo1AADlNQAAFDYAADA2AABMNgAAaTYAAIE2AACYNgAArzYAAMM2AADc"
+    "NgAA9DYAAAk3AAAeNwAANDcAAEY3AABYNwAAbDcAAH03AACONwAAnzcAALg3AAC/NwAAxTcAAM43AADYNwAA3jcAAOY3AADuNwAA"
+    "9DcAABI4AAAjOAAANTgAADg4AAA8OAAAQDgAAEY4AABNOAAAUTgAAFY4AABbOAAAYTgAAGo4AABwOAAAdDgAAHc4AAB7OAAAfzgA"
+    "AIQ4AACHOAAAizgAAKo4AAC+OAAA0zgAAOg4AAAFOQAADjkAABo5AAAmOQAAMjkAAD45AABLOQAAVjkAAGQ5AABzOQAAgDkAAIg5"
+    "AACNOQAAnjkAALE5AADDOQAA7jkAAPY5AAAEOgAACjoAABk6AAAnOgAANToAADs6AABDOgAATDoAAFM6AABaOgAAXzoAAGk6AABy"
+    "OgAAfToAAIc6AACXOgAAoDoAAK86AAC9OgAAwjoAAMY6AADJOgAA0zoAAN46AADlOgAA7ToAAPQ6AAABOwAACTsAABA7AAAYOwAA"
+    "JDsAAC07AAA9OwAAQjsAAFk7AABjOwAAbTsAAHY7AACAOwAAkDsAAKE7AAC8OwAAzjsAAOE7AAD1OwAAAjwAABQ8AAAoPAAANTwA"
+    "AEY8AABRPAAAWjwAAG48AAB+PAAAjzwAAKI8AACtPAAAvDwAAMo8AADbPAAA5DwAAO08AAD6PAAAAz0AAA09AAAWPQAAHj0AACo9"
+    "AAAuPQAAMz0AADo9AABDPQAATT0AAFU9AABePQAAcT0AAH09AACKPQAAlz0AAKU9AACvPQAAtT0AAMc9AADSPQAA2j0AAOI9AADv"
+    "PQAA+j0AAAM+AAALPgAAFD4AABk+AAAmPgAALD4AADI+AAA9PgAARz4AAGA+AACJPgAArj4AANk+AAD8PgAAHz8AAD4/AABmPwAA"
+    "hT8AAJk/AACqPwAAwD8AAMo/AADUPwAA2T8AAOs/AADxPwAA+T8AAAJAAAAKQAAAFkAAAB5AAAAuQAAAOEAAAD1AAABMQAAAVkAA"
+    "AGBAAABxQAAAfUAAAI5AAACZQAAApEAAALVAAADEQAAAykAAANBAAADbQAAA4kAAAO5AAAD6QAAAB0EAABhBAAAjQQAANEEAADpB"
+    "AABGQQAATUEAAFZBAABjQQAAbUEAAHhBAACAQQAAiUEAAKBBAACwQQAAuUEAAMBBAADJQQAAz0EAANVBAAAUAAAAGgAAAB4AAAAm"
+    "AAAANQAAADYAAAA3AAAAOAAAADkAAAA6AAAAOwAAADwAAAA9AAAAPgAAAD8AAABAAAAAQQAAAEIAAABDAAAARAAAAEUAAABGAAAA"
+    "RwAAAEgAAABJAAAASgAAAEwAAABNAAAATgAAAE8AAABQAAAAUQAAAFIAAABTAAAAVAAAAFUAAABWAAAAVwAAAFgAAABZAAAAWgAA"
+    "AFsAAABcAAAAXQAAAF4AAABfAAAAYAAAAGEAAABiAAAAYwAAAGUAAABmAAAAZwAAAGgAAABpAAAAagAAAGsAAABtAAAAbgAAAHAA"
+    "AABxAAAAfQAAAIkAAACOAAAAjwAAAJAAAACRAAAAkgAAAJMAAAAVAAAAAAAAAKAuAAAaAAAAAQAAAAAAAAAbAAAAAQAAAKguAAAe"
+    "AAAAAgAAAAAAAAAfAAAAAgAAALAuAAAgAAAAAgAAALguAAAjAAAAAgAAAMAuAAAlAAAAAgAAAMguAAAkAAAAAgAAANAuAAAlAAAA"
+    "AgAAANguAAAkAAAAAgAAAOAuAAAlAAAAAgAAAOguAAAmAAAAAwAAAAAAAAAnAAAAAwAAANAuAAAoAAAABQAAAAAAAAAwAAAAEwAA"
+    "APAuAAA0AAAAFgAAAPguAAAoAAAAGQAAAAAAAAAvAAAAGQAAAAAvAAAvAAAAGQAAAOAuAAAzAAAAGQAAAAgvAAAoAAAAGgAAAAAA"
+    "AAArAAAAHgAAALguAAAsAAAAIAAAAKAuAAAtAAAAIgAAABQvAAAoAAAAJwAAAAAAAAAxAAAAJwAAABwvAAAvAAAAJwAAANAuAAAw"
+    "AAAAJwAAANguAAAwAAAAJwAAACgvAAAxAAAAJwAAADAvAAAwAAAAJwAAADwvAAAwAAAAJwAAAOguAAAoAAAAKAAAAAAAAAAqAAAA"
+    "KAAAAEQvAAAsAAAAKAAAAKAuAAAwAAAAKAAAAEwvAAAvAAAAKAAAANAuAAAvAAAAKAAAAOAuAAAvAAAAKAAAAFQvAAAvAAAAKAAA"
+    "AFwvAAApAAAAKQAAALAuAAAsAAAAKQAAAKAuAAAvAAAAKQAAAOAuAAAoAAAAKgAAAAAAAAAwAAAAKwAAAGQvAAAvAAAAKwAAAOAu"
+    "AAAxAAAALgAAAGwvAAAxAAAALgAAABwvAAAwAAAALgAAAHgvAAAoAAAANwAAAAAAAAAuAAAAOAAAAIAvAAAoAAAAOgAAAAAAAAAv"
+    "AAAAOgAAAIgvAAB9AAAAPQAAAAAAAAB+AAAAPQAAALguAAB/AAAAPQAAAKAuAACAAAAAPQAAAJAvAACBAAAAPQAAAJwvAACCAAAA"
+    "PQAAAKgvAACDAAAAPQAAALAvAACCAAAAPQAAALgvAACGAAAAPQAAAMAvAACCAAAAPQAAANAuAACDAAAAPQAAANAvAACEAAAAPQAA"
+    "ANguAACFAAAAPQAAANgvAACHAAAAPQAAAOQvAACCAAAAPQAAAOAuAACCAAAAPQAAAPAvAACEAAAAPQAAAPgvAACCAAAAPQAAAIgv"
+    "AACIAAAAPQAAAPguAACJAAAAPgAAAAAAAACKAAAAPgAAALAuAACLAAAAPgAAAAAwAACLAAAAPgAAANAuAACLAAAAPgAAAOAuAACM"
+    "AAAAPgAAAAgwAAAoAAAAQQAAAAAAAAAvAAAAQgAAAFwvAAAyAAAAQwAAABAwAAAvAAAAQwAAAOAuAAAoAAAARAAAAAAAAAAGAAIA"
+    "6AAAAAYAAgA6AQAACAA+AMEAAAAIAAIA9wAAAAkAAwC4AAAACQAoACwBAAAJAEMANAEAAAkAKAA2AQAACgAJAL0AAAAKAAIAFwEA"
+    "AAsAAgDoAAAACwAnAEIBAAAMAAIAHAAAAAwAAgB0AAAADAACAHUAAAAMAAIAdwAAAAwAAgCcAAAADAA+AJ4AAAAMADoArAAAAAwA"
+    "OgDDAAAADAAxAOUAAAAMADEA6wAAAAwAOgDsAAAADAAoAPkAAAAMABoA+wAAAAwAOgAAAQAADAACAAIBAAAMADoAFAEAAAwAOgAe"
+    "AQAADAACACoBAAAMAC4APAEAABIAQgCmAAAAEgAnADUBAAAWABkAeQAAABwAGQB5AAAAHgAZAHkAAAAgABkAeQAAACIAGQB5AAAA"
+    "LwAvAHMAAAA5ADkAdgAAAAQANgCpAAAABAABAMkAAAAEAA4A1wAAAAQAAwDbAAAABAADANwAAAAEAAEA4QAAAAQANwAhAQAABAA7"
+    "ACMBAAAEADcAKAEAAAQAOAApAQAABwA2ABEAAAAHAAkAsQAAAAgAOAARAAAACAA9AKEAAAAJADkAEQAAAAoAPAARAAAACwBAABEA"
+    "AAAMADYAEAAAAAwANgARAAAADABOAJQAAAAMAEkAlQAAAAwAPQCWAAAADAA9AJcAAAAMAEUAmAAAAAwACACbAAAADAA+AJ8AAAAM"
+    "AD8ApQAAAAwAQQCnAAAADAAeAKoAAAAMADYArgAAAAwAEwCvAAAADAAmALAAAAAMAD8AtgAAAAwAPwC3AAAADAAFALkAAAAMAC8A"
+    "vwAAAAwALQDCAAAADABMAMYAAAAMAB0AxwAAAAwAPQDoAAAADABRAO0AAAAMAAcA+AAAAAwAIQD5AAAADAAzAP4AAAAMADAA/wAA"
+    "AAwAJgAFAQAADAANAAYBAAAMAD8AEwEAAAwACwAXAQAADABFABoBAAAMAD8AGwEAAAwAPQAcAQAADABDAB8BAAAMADoAIgEAAAwA"
+    "QgAnAQAADAAaAC8BAAAMACAAMAEAAAwAEgBDAQAAEgAZAN4AAAASACwA4AAAABIAPwAmAQAAEwA2ADsBAAAUADgAEQAAABUADwDp"
+    "AAAAFgBJAKgAAAAWABAAQQEAABgABADiAAAAGABKAPQAAAAYAEoA9QAAABkAEwDFAAAAGQAUAMUAAAAZABUAzQAAABkALgDQAAAA"
+    "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"
+    "bhB3AAQADAVuIGEAdQAKBTgFIgBuEHgABAAMBSFVM4UbADkDBAAHQygWIgYfACIIKQAaCRMAcCBsAJgAbiBvAHgADAduEHEABwAM"
+    "B3AgUQB2ACcG2AICASjQOANUABIWbiB6AGMAIgYIAHAgDACWAHEgPwBjAAwGOAYwAGIIFABuIH0AaAAkIEIAagAMBm4weQAbBgwG"
+    "OAYMAGIHFQBuEF0ABgAMBm4gfQBnAA4AIgYfACIIKQAaCXwAcCBsAJgAbiBvAHgADAduEHEABwAMB3AgUQB2ACcGIgYfACIIKQAa"
+    "CR0AcCBsAJgAbiBvAHgADAduEHEABwAMB3AgUQB2ACcGIgYlAHAgVwB2ACcGAAAKAAEABQAAALItAAC3AAAAYgAcAHIgjwCQAAwA"
+    "HwALADkAAwAOABoBEQFxICYAGQAMAR8BJgBuEFkAAQAKARoCEAFxICYAKQAMAh8CJgBuEFkAAgAKAhoDHQFxICYAOQAMAx8DBABu"
+    "EFwAAwAMBBJVI1VBAGIGJAASB00GBQcSFmIIJABNCAUGEiZiCCQATQgFBhI2YggkAE0IBQYSRmIIIQBNCAUGGgYkAXEwIwBkBQwE"
+    "bhADAAMACgVxEFIABQAMBVIGCgCwFnEQUgAGAAwGbhAEAAMACghxEFIACAAMCHEQUgACAAwCcRBBAAcADAckV0IAZSgMAm4weQA0"
+    "AlQCCwAfAgQAbhACAAIADAMfAwYAUjQBADMUCABSNAAAUgUKADJUCwBZMQEAUgQKAFk0AABuIAcAMgAaA7wAcSAmADkADAkfCQQA"
+    "OAkXAG4QAgAJAAwDHwMGAFI0AQBSBQoAsBUyVAoAUgAKALABWTEBAG4gBwA5AG4QAAACAA4AAAADAAIAAwAAAM0tAAAGAAAAYgAb"
+    "AHIwkAAQAg4ABQAAAAMABgDULQAAVgAAABwADAAdABIBagERAGIBFABuEH8AAQAMAXIQiQABAAoCOAIMAHIQigABAAwCHwITAG4Q"
+    "PQACACjxYgEUAG4QfgABAGIBHgA4AR8AYgEVAG4QfwABAAwBchCJAAEACgI4AhMAchCKAAEADAIfAigAYgMeACQQQgACAAwCEgRu"
+    "MHkAQwIo6mIBFQBuEH4AAQBiARsAchCOAAEAYgEcAHIQjgABAB4ADgANAR4AJwEEAAAAFAABABgAAAADAAMAHAAAABsAAQA3AAAA"
+    "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"
+    "TExMTExJSUkABExMWkwAAkxaABNMYW5kcm9pZC92aWV3L1ZpZXc7ACVMYW5kcm9pZC92aWV3L1ZpZXdHcm91cCRMYXlvdXRQYXJh"
+    "bXM7ACtMYW5kcm9pZC92aWV3L1ZpZXdHcm91cCRNYXJnaW5MYXlvdXRQYXJhbXM7ABhMY2hhdC90YWdzL1RhZ3NCcmlkZ2UkMDsA"
+    "H0xjaGF0L3RhZ3MvVGFnc0JyaWRnZSRDYWxsYmFjazsAHExjaGF0L3RhZ3MvVGFnc0JyaWRnZSRFbnRyeTsAHExjaGF0L3RhZ3Mv"
+    "VGFnc0JyaWRnZSRNYXRjaDsAHUxjaGF0L3RhZ3MvVGFnc0JyaWRnZSRTZWFyY2g7ABZMY2hhdC90YWdzL1RhZ3NCcmlkZ2U7ACJM"
+    "ZGFsdmlrL2Fubm90YXRpb24vRW5jbG9zaW5nQ2xhc3M7AB5MZGFsdmlrL2Fubm90YXRpb24vSW5uZXJDbGFzczsAIUxkYWx2aWsv"
+    "YW5ub3RhdGlvbi9NZW1iZXJDbGFzc2VzOwAdTGRhbHZpay9hbm5vdGF0aW9uL1NpZ25hdHVyZTsAGkxkYWx2aWsvYW5ub3RhdGlv"
+    "bi9UaHJvd3M7ADZMZGUvcm9idi9hbmRyb2lkL3hwb3NlZC9YQ19NZXRob2RIb29rJE1ldGhvZEhvb2tQYXJhbTsALUxkZS9yb2J2"
+    "L2FuZHJvaWQveHBvc2VkL1hDX01ldGhvZEhvb2skVW5ob29rOwAmTGRlL3JvYnYvYW5kcm9pZC94cG9zZWQvWENfTWV0aG9kSG9v"
+    "azsAJUxkZS9yb2J2L2FuZHJvaWQveHBvc2VkL1hwb3NlZEJyaWRnZTsAE0xqYXZhL2xhbmcvQm9vbGVhbjsAGExqYXZhL2xhbmcv"
+    "Q2hhclNlcXVlbmNlOwAVTGphdmEvbGFuZy9DaGFyYWN0ZXI7ABFMamF2YS9sYW5nL0NsYXNzOwARTGphdmEvbGFuZy9DbGFzczwA"
+    "F0xqYXZhL2xhbmcvQ2xhc3NMb2FkZXI7ACJMamF2YS9sYW5nL0NsYXNzTm90Rm91bmRFeGNlcHRpb247ABJMamF2YS9sYW5nL0Rv"
+    "dWJsZTsAFUxqYXZhL2xhbmcvRXhjZXB0aW9uOwARTGphdmEvbGFuZy9GbG9hdDsAIUxqYXZhL2xhbmcvSWxsZWdhbFN0YXRlRXhj"
+    "ZXB0aW9uOwATTGphdmEvbGFuZy9JbnRlZ2VyOwAYTGphdmEvbGFuZy9MaW5rYWdlRXJyb3I7ABBMamF2YS9sYW5nL0xvbmc7ABBM"
+    "amF2YS9sYW5nL01hdGg7ACBMamF2YS9sYW5nL05vU3VjaEZpZWxkRXhjZXB0aW9uOwAhTGphdmEvbGFuZy9Ob1N1Y2hNZXRob2RF"
+    "eGNlcHRpb247ABJMamF2YS9sYW5nL051bWJlcjsAEkxqYXZhL2xhbmcvT2JqZWN0OwASTGphdmEvbGFuZy9TdHJpbmc7ABlMamF2"
+    "YS9sYW5nL1N0cmluZ0J1aWxkZXI7ABVMamF2YS9sYW5nL1Rocm93YWJsZTsAGUxqYXZhL2xhbmcvcmVmbGVjdC9GaWVsZDsALUxq"
+    "YXZhL2xhbmcvcmVmbGVjdC9JbnZvY2F0aW9uVGFyZ2V0RXhjZXB0aW9uOwAaTGphdmEvbGFuZy9yZWZsZWN0L01lbWJlcjsAGkxq"
+    "YXZhL2xhbmcvcmVmbGVjdC9NZXRob2Q7ABtMamF2YS90ZXh0L05vcm1hbGl6ZXIkRm9ybTsAFkxqYXZhL3RleHQvTm9ybWFsaXpl"
+    "cjsAFUxqYXZhL3V0aWwvQXJyYXlMaXN0OwAVTGphdmEvdXRpbC9BcnJheUxpc3Q8ABJMamF2YS91dGlsL0FycmF5czsAF0xqYXZh"
+    "L3V0aWwvQ29sbGVjdGlvbnM7ABZMamF2YS91dGlsL0NvbXBhcmF0b3I7ABNMamF2YS91dGlsL0hhc2hNYXA7ABNMamF2YS91dGls"
+    "L0hhc2hTZXQ7ABRMamF2YS91dGlsL0l0ZXJhdG9yOwAQTGphdmEvdXRpbC9MaXN0OwAQTGphdmEvdXRpbC9MaXN0PAASTGphdmEv"
+    "dXRpbC9Mb2NhbGU7AA9MamF2YS91dGlsL01hcDsAD0xqYXZhL3V0aWwvTWFwPAAPTGphdmEvdXRpbC9TZXQ7ABdMamF2YS91dGls"
+    "L1dlYWtIYXNoTWFwOwAFTWF0Y2gABE5GS0MAB1BBRERJTkcACFBPU0lUSU9OAARST09UAAZTRUFSQ0gABlNlYXJjaAAEVFlQRQAc"
+    "VGFnc0JyaWRnZSBjYWxsYmFjayBkaXNhYmxlZAAPVGFnc0JyaWRnZS5qYXZhABBVbnRyYWNrZWQgaG9vazogAAFWAAJWRgACVkkA"
+    "BFZKTEwABVZKTExMAAJWTAADVkxJAANWTEwABFZMTEkAB1ZMTElJTEwABFZMTEwAAlZaAAFaAAJaQwACWkwAA1pMTAABWwACW0oA"
+    "HVtMY2hhdC90YWdzL1RhZ3NCcmlkZ2UkRW50cnk7ABJbTGphdmEvbGFuZy9DbGFzczsAE1tMamF2YS9sYW5nL09iamVjdDsAE1tM"
+    "amF2YS9sYW5nL1N0cmluZzsAG1tMamF2YS9sYW5nL3JlZmxlY3QvTWV0aG9kOwAHYWNjZXB0cwAKYWNjZXNzJDAwMAAKYWNjZXNz"
+    "JDEwMAAKYWNjZXNzJDIwMAAKYWNjZXNzJDMwMAALYWNjZXNzRmxhZ3MACWFjdGlvbkJhcgAMYWN0aW9uQmFyVG9wAA1hY3Rpb25z"
+    "SGVpZ2h0AAthY3Rpb25zVmlldwAGYWN0aXZlAANhZGQAD2FkZFBsdWdpblVuaG9vawARYWZ0ZXJIb29rZWRNZXRob2QAEGFuZHJv"
+    "aWQudXRpbC5Mb2cAKWFwcC5leHRlcmFsZXNzLnBsdWdpbnMueHBvc2VkLlhwb3NlZEhvb2tzAAZhcHBlbmQADGFwcGx5UGFkZGlu"
+    "ZwAEYXJncwANYXR0YWNoUHJvZmlsZQAMYm9vbGVhblZhbHVlAAxicmluZ1RvRnJvbnQABGNhbGwABmNoYXJBdAAHY2xhc3NlcwAF"
+    "Y2xlYXIABWNsb3NlAANjbHMACGNvbGxhcHNlAAdjb21wYXJlAAljb21wYXJlVG8ACGNvbnRhaW5zAA5jdXJyZW50QWNjb3VudAAH"
+    "ZGVsZXRlZAANZGV0YWNoUHJvZmlsZQAMZGV0YWNoU2VhcmNoAANkaWQAAmRwAAFlAAhlbXB0eU1hcAAJZW1wdHlWaWV3AAVlbnRy"
+    "eQAGZXF1YWxzAAVleGFjdAALZXh0cmFIZWlnaHQABmZhaWxlZAAFZmllbGQABmZpZWxkcwAKZmxvYXRWYWx1ZQAHZm9yTmFtZQAO"
+    "Z2FsbGVyeU9wZW5pbmcAA2dldAAVZ2V0QWN0aW9uc0V4dHJhSGVpZ2h0AAhnZXRBbHBoYQAIZ2V0Q2F1c2UAB2dldENoYXQACGdl"
+    "dENsYXNzAA5nZXRDbGFzc0xvYWRlcgAPZ2V0Q2xpZW50VXNlcklkABlnZXRDdXJyZW50QWN0aW9uQmFySGVpZ2h0ABBnZXREZWNs"
+    "YXJlZEZpZWxkABFnZXREZWNsYXJlZE1ldGhvZAASZ2V0RGVjbGFyZWRNZXRob2RzAAtnZXREaWFsb2dJZAAQZ2V0RW5jcnlwdGVk"
+    "Q2hhdAASZ2V0RW5jcnlwdGVkQ2hhdElkAAtnZXRJbnN0YW5jZQAPZ2V0TGF5b3V0UGFyYW1zAAlnZXRNZXRob2QAB2dldE5hbWUA"
+    "EmdldE9jY3VweVN0YXR1c0JhcgAOZ2V0UGFkZGluZ0xlZnQAD2dldFBhZGRpbmdSaWdodAARZ2V0UGFyYW1ldGVyVHlwZXMACWdl"
+    "dFJlc3VsdAANZ2V0U3VwZXJjbGFzcwAMZ2V0VGhyb3dhYmxlAA9nZXRUcmFuc2xhdGlvblkAB2dldFR5cGUAB2dldFVzZXIAC2dl"
+    "dFVzZXJOYW1lAAdoYW5kbGVzAAhoYXNNdXNpYwAHaGFzTmV4dAAGaGVpZ2h0AApob29rTWV0aG9kAAJpZAADaWRzAAVpbmRleAAH"
+    "aW5zdGFsbAAIaW50VmFsdWUABmludm9rZQAHaXNFbXB0eQARaXNFbmNyeXB0ZWREaWFsb2cACmlzSW5zdGFuY2UAC2lzUHJpbWl0"
+    "aXZlAAtpc1NwYWNlQ2hhcgAMaXNXaGl0ZXNwYWNlAAhpdGVyYXRvcgAEa2luZAAQbGFtYmRhJG1hdGNoZXMkMAAJbGFzdEVycm9y"
+    "AAZsZW5ndGgABmxvYWRlcgALbG9jYWxTZWFyY2gACWxvbmdWYWx1ZQAHbWF0Y2hlcwAGbWV0aG9kAAdtZXRob2RzAANtaW4AC211"
+    "c2ljSGVpZ2h0AARuYW1lAARuZXh0AAlub3JtYWxpemUACG9iamVjdElkABdvcGVuQW5pbWF0aW9uSW5Qcm9ncmVzcwAnb3JnLnRl"
+    "bGVncmFtLm1lc3Nlbmdlci5BbmRyb2lkVXRpbGl0aWVzACNvcmcudGVsZWdyYW0ubWVzc2VuZ2VyLkRpYWxvZ09iamVjdAApb3Jn"
+    "LnRlbGVncmFtLm1lc3Nlbmdlci5NZXNzYWdlc0NvbnRyb2xsZXIAIW9yZy50ZWxlZ3JhbS5tZXNzZW5nZXIuVXNlckNvbmZpZwAh"
+    "b3JnLnRlbGVncmFtLm1lc3Nlbmdlci5Vc2VyT2JqZWN0AB1vcmcudGVsZWdyYW0udGduZXQuVExSUEMkQ2hhdAAmb3JnLnRlbGVn"
+    "cmFtLnRnbmV0LlRMUlBDJEVuY3J5cHRlZENoYXQAHW9yZy50ZWxlZ3JhbS50Z25ldC5UTFJQQyRVc2VyABJwYWdlc1BhZGRpbmdC"
+    "b3R0b20AD3BhZ2VzUGFkZGluZ1RvcAAUcGxheVByb2ZpbGVBbmltYXRpb24ACHBvc2l0aW9uAAhwcm9maWxlcwADcHV0ABBwdXRF"
+    "bmNyeXB0ZWRDaGF0AARyYW5rAAZyZW1vdmUAB3JlcGxhY2UABnJlcG9ydAAKcmVwb3NpdGlvbgAGc2VhcmNoAA5zZWFyY2hMaXN0"
+    "VmlldwAIc2VhcmNoZXMAA3NldAANc2V0QWNjZXNzaWJsZQAIc2V0QWxwaGEACHNldEluZGV4AA9zZXRMYXlvdXRQYXJhbXMACnNl"
+    "dFBhZGRpbmcAD3NldFBhZ2VzUGFkZGluZwAJc2V0UmVzdWx0AAlzZXRTZWFyY2gAD3NldFRyYW5zbGF0aW9uWQANc2V0VmlzaWJp"
+    "bGl0eQAEc2xvdAAEc29ydAAJc29ydFRpdGxlAAVzcGxpdAAKc3RhcnRzV2l0aAAKc3RhdGljQ2FsbAALc3RhdGljRmllbGQAD3N0"
+    "YXR1c0JhckhlaWdodAAJc3Vic3RyaW5nAA9zeW5jaHJvbml6ZWRNYXAABHRhZ3MACnRoaXNPYmplY3QABXRpdGxlAAd0b0FycmF5"
+    "AAt0b0xvd2VyQ2FzZQAIdG9TdHJpbmcACXRvcE1hcmdpbgAGdW5ob29rAAd1bnRyYWNrABV1cGRhdGVBY3Rpb25zUG9zaXRpb24A"
+    "DnVwZGF0ZVBvc2l0aW9uAAd1c2VyX2lkAAV2YWx1ZQAHdmFsdWVPZgAEdmlldwAEd3JhcABofn5EOHsiYmFja2VuZCI6ImRleCIs"
+    "ImNvbXBpbGF0aW9uLW1vZGUiOiJyZWxlYXNlIiwiaGFzLWNoZWNrc3VtcyI6ZmFsc2UsIm1pbi1hcGkiOjI2LCJ2ZXJzaW9uIjoi"
+    "OS40LjI0In0AAg0BwAIYDAIOApkBBBqDAhcWAg4CmQEEGIMCFxkCDgKZAQQYgwIXcgIOApkBBBiDAhd4AhABwAIcChcEF0sXChdL"
+    "FwoXSxcKF1oXIhdaAhEBwAIcARgdAhABwAIcCBcEF0sXChdaFyEXWhdgFwgCEAHAAhwGFwUXWhcHF2wXOxcSAhABwAIcBRcEF1oX"
+    "BxdLFwoCEQHAAhwBGBsCEAHAAhwGFwQXSxcKF1oXBxddAhEBwAIcARgkAhABwAIcCBcEF0sXChdaF40XWRcHF2ACEQHAAhwBGCUC"
+    "EAHAAhwFFwYXSxcNF1kXCQIQAcACHAUXBBdLFwsXSxcKAhABwAIcCBcEF0sXChdaF40XSxcLF2ACEAHAAhwIFwQXSxcKF1oXjRdZ"
+    "FwcXWQIQAcACHAUXbxdUF40XOhcSAhABwAIcBBdvF1kXWRcSAhABwAIcBBdvF1kXPBcSAhABwAIcAxdkF0QXEgIQAcACHAMXZBda"
+    "FxICEAHAAhwEF28XWhddFxICEAHAAhwEF28XWhdgFxICEAHAAhwEF28XWhdLFwwCDwHAAhwEGAgYCRgLGAoAAAEBCoGgBNQiCxGw"
+    "IgACAQECAgESDICABOwiDQSMIwAEAQAEEAEQARABEA6AgAScJAACAQAIEAEQD4CABMwkAAIBAAoQARAQgIAE7CQTACkADBgBGAEY"
+    "ARgBCgFKARoBGgEaARoBSgFKAQoBGgEKARoBGgEKAQoRiIAEjD0BgoAEnD4BCowlAYgg3CUBiCC0PgGIIMw+AYgg5D4BCsgmAQr8"
+    "PgEItEEBCbREAYoBvCsBiYAI0EQBCvQpAQrkLAEJxEYBCeBGAQrMJwGKAag1AQioMwEK9CUBCugrAQr8RgGJgAjcLwGIIJQoAQnw"
+    "LQEInDoBCrg3AQiILgEK0DsBCORHAQj0KAEK+EoBCZBMAQrITAEKvFYBCeRWAQnoVwGKAZQsAQq4LAEK2CoEBAAEAwQBBAICAAAA"
+    "P0IAAEZCAAACAAAAP0IAAFFCAAACAAAAP0IAAFxCAAACAAAAP0IAAGdCAAACAAAAckIAAI1CAAACAAAAlkIAAI1CAAABAAAArUIA"
+    "AAEAAACNQgAAAgAAAMBCAADRQgAAAgAAANpCAADtQgAAAgAAAPZCAAANQwAAAQAAABZDAAABAAAAJ0MAAAIAAAA4QwAADUMAAAIA"
+    "AABPQwAAjUIAAAEAAABmQwAAAQAAAHdDAAABAAAAhkMAAAEAAACVQwAAAQAAAKJDAAABAAAAr0MAAAEAAAC+QwAAAQAAAM1DAAAB"
+    "AAAA3EMAACBFAAAAAAAAAAAAAAAAAAAsRQAAAAAAAAAAAAAAAAAAOEUAAAAAAAAAAAAAAAAAAERFAAAAAAAAAAAAAAAAAAAERgAA"
+    "CAAAABgAAAAAAAAAEgAAAPxFAAATAAAA7EUAABQAAADcRQAAFQAAAORFAAAWAAAAxEUAABkAAAD0RQAAGwAAAMxFAAAcAAAA1EUA"
+    "ABMAAACcRQAAFQAAAHBFAAAWAAAAcEUAABgAAABwRQAAGQAAAFxFAAAaAAAAcEUAABwAAABwRQAAHgAAAHhFAAAiAAAAcEUAACMA"
+    "AACsRQAAJAAAAIRFAAAlAAAAcEUAACYAAABwRQAAJwAAAHBFAAAoAAAAUEUAACsAAABoRQAALAAAAJBFAAAuAAAAcEUAAC8AAABw"
+    "RQAAMwAAAHBFAAA0AAAAcEUAADcAAAC4RQAAOAAAAHBFAAA5AAAApEUAABEAAAAAAAAAAQAAAAAAAAABAAAARQEAAHAAAAACAAAA"
+    "RQAAAIQFAAADAAAAVAAAAJgGAAAEAAAAKAAAAIgKAAAFAAAAlQAAAMgLAAAGAAAABgAAAHAQAAABIAAAMAAAADARAAADIAAALgAA"
+    "ACssAAABEAAAKwAAAJguAAACIAAARQEAACIwAAAEIAAAHAAAAD9CAAAAIAAABgAAAOtDAAAFIAAAAQAAABdFAAADEAAAGAAAACBF"
+    "AAAGIAAABQAAAAxGAAAAEAAAAQAAAFxHAAA="
+)
