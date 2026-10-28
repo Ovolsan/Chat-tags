@@ -16,6 +16,8 @@ public class View {
     public float getAlpha() {return 1;}
     public void setAlpha(float a) {}
     public void setVisibility(int v) {}
+    public int getVisibility() {return 0;}
+    public boolean isShown() {return true;}
     public int getTop() {return 0;}
     public int getPaddingTop() {return 0;}
     public int getPaddingLeft() {return 0;}

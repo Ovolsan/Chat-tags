@@ -29,10 +29,13 @@ public final class TagsBridge {
      */
     static final class Search implements ViewTreeObserver.OnPreDrawListener {
         final View root, list;
+        final Object pager;
         final ViewTreeObserver observer;
         int height;
         boolean failed;
-        Search(View r, View l, int h) {root = r; list = l; height = h; observer = l.getViewTreeObserver();}
+        Search(Object p, View r, View l, int h) {
+            pager = p; root = r; list = l; height = h; observer = l.getViewTreeObserver();
+        }
 
         @Override
         public boolean onPreDraw() {
@@ -129,7 +132,7 @@ public final class TagsBridge {
             if (s == null || s.root != view) {
                 if (s != null) unlisten(s);
                 View list = (View) get(pager, "searchListView");
-                s = new Search((View) view, list, height);
+                s = new Search(pager, (View) view, list, height);
                 s.observer.addOnPreDrawListener(s);
                 searches.put(pager, s);
             }
@@ -307,10 +310,25 @@ public final class TagsBridge {
                 shift = offset(position == 0, first.getTop(), list.getPaddingTop(), params.topMargin + s.height);
             }
             if (s.root.getTranslationY() != shift) s.root.setTranslationY(shift);
+            releaseHiddenTabs(s);
         } catch (Throwable e) {
             s.failed = true; // runs every frame: report once
             report(e);
         }
+    }
+
+    /**
+     * During search the client fades the chat folder tabs to alpha 0 and moves
+     * them down, but can leave them VISIBLE: the transparent bar then takes the
+     * taps meant for the second row of buttons. Hide it for touch while it is
+     * fully transparent; the client sets VISIBLE/GONE again with its alpha.
+     */
+    static void releaseHiddenTabs(Search s) throws Exception {
+        if (s.height <= 0 || s.root.getVisibility() != 0) return;
+        Object parent = get(s.pager, "parent");
+        if (parent == null) return;
+        View tabs = (View) get(parent, "filterTabsView");
+        if (tabs != null && tabs.getVisibility() == 0 && tabs.getAlpha() < 0.02f) tabs.setVisibility(4);
     }
 
     // ---- Cached reflection ----------------------------------------------

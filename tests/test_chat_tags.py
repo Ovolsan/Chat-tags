@@ -316,6 +316,18 @@ class SearchSuggestionsTests(unittest.TestCase):
         self.assertEqual(chip.text, "Очень длинное…")
         self.assertLessEqual(len(chip.text), 15)
 
+    def test_faded_folder_tabs_stop_taking_taps_over_buttons(self):
+        tabs = FakeView()
+        tabs.alpha = 0.0
+        tabs.getAlpha = lambda: tabs.alpha
+        tabs.getVisibility = lambda: tabs.visibility
+        self.state["parent"].filterTabsView = tabs
+        self.render()
+        self.assertEqual(tabs.visibility, 4)
+        tabs.visibility, tabs.alpha = 0, 1.0  # client shows the folders again
+        self.instance._sync_search_scroll(self.state)
+        self.assertEqual(tabs.visibility, 0)
+
     def test_three_short_names_fit_and_need_no_expand_button(self):
         for n, match in enumerate(self.state["matches"]):
             match["title"] = "Чат" + str(n)
