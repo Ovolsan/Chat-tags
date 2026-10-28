@@ -2,16 +2,11 @@ package chat.tags;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.WeakHashMap;
 import android.view.View;
 import android.view.ViewGroup;
@@ -20,28 +15,26 @@ import de.robv.android.xposed.XposedBridge;
 
 /**
  * Hot paths of the Chat tags plugin: profile height and position on every
- * scroll frame, localSearch on the storage queue and search list padding.
- * Python keeps storage, views, dialogs and settings and pushes snapshots here.
+ * scroll frame, search list padding and the tag buttons following the list.
+ * Python keeps storage, matching, views, dialogs and settings.
  */
 public final class TagsBridge {
-    static final int HEIGHT = 0, POSITION = 1, SEARCH = 2, PADDING = 3;
+    static final int HEIGHT = 0, POSITION = 1, PADDING = 2;
 
-    /** Immutable per-account index: pre-normalized tags from Python. */
-    static final class Entry {
-        final long did; final String title, sortTitle; final String[] tags;
-        Entry(long d, String t, String[] g) {did = d; title = t; sortTitle = normalize(t); tags = g;}
-    }
-    static final class Match {
-        final Entry entry; final int rank;
-        Match(Entry e, int r) {entry = e; rank = r;}
-    }
-    static final class Search {
-        final Object view; final int height;
-        Search(Object v, int h) {view = v; height = h;}
+    /** Tag buttons above one search list; they scroll away with its first row. */
+    static final class Search implements View.OnScrollChangeListener, View.OnLayoutChangeListener {
+        final View root, list;
+        int height;
+        Search(View r, View l, int h) {root = r; list = l; height = h;}
+
+        @Override
+        public void onScrollChange(View v, int x, int y, int oldX, int oldY) {sync(this);}
+
+        @Override
+        public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {sync(this);}
     }
 
     private static volatile boolean active;
-    private static volatile Map<Long, Entry[]> index = Collections.emptyMap();
     private static final Map<Object, Object> profiles = Collections.synchronizedMap(new WeakHashMap<Object, Object>());
     private static final Map<Object, Search> searches = Collections.synchronizedMap(new WeakHashMap<Object, Search>());
     private static final ArrayList<XC_MethodHook.Unhook> handles = new ArrayList<>();
@@ -57,9 +50,8 @@ public final class TagsBridge {
 
     // ---- Lifecycle ------------------------------------------------------
 
-    public static synchronized String[] install(Class<?> profile, Class<?> storage, Class<?> pager,
-                                                String pluginId, int slotPx, int actionsPx, int musicPx)
-            throws Exception {
+    public static synchronized String[] install(Class<?> profile, Class<?> pager, String pluginId,
+                                                int slotPx, int actionsPx, int musicPx) throws Exception {
         close();
         loader = profile.getClassLoader();
         slot = slotPx; actionsHeight = actionsPx; musicHeight = musicPx;
@@ -71,11 +63,9 @@ public final class TagsBridge {
                 "playProfileAnimation", "hasMusic", "actionBar"}) field(profile, n);
         for (String n : new String[]{"pagesPaddingTop", "pagesPaddingBottom", "searchListView", "emptyView"})
             field(pager, n);
-        field(storage.getSuperclass(), "currentAccount");
         try {
             add(profile, "getActionsExtraHeight", 1, HEIGHT, pluginId, track);
             add(profile, "updateActionsPosition", 0, POSITION, pluginId, track);
-            add(storage, "localSearch", 7, SEARCH, pluginId, track);
             add(pager, "setPagesPadding", 3, PADDING, pluginId, track);
             active = true;
             return ids.toArray(new String[0]);
@@ -92,7 +82,10 @@ public final class TagsBridge {
         if (untrack != null) for (String id : ids) try {untrack.invoke(null, id);} catch (Throwable ignored) {}
         ids.clear();
         profiles.clear();
-        searches.clear();
+        synchronized (searches) {
+            for (Search s : searches.values()) unlisten(s);
+            searches.clear();
+        }
     }
 
     public static String lastError() {return lastError;}
@@ -117,93 +110,44 @@ public final class TagsBridge {
 
     // ---- State pushed from Python ---------------------------------------
 
-    /** tags[i] holds the normalized tags of dids[i], separated by '\n'. */
-    public static void setIndex(long uid, long[] dids, String[] titles, String[] tags) {
-        Entry[] entries = new Entry[dids.length];
-        for (int i = 0; i < dids.length; i++)
-            entries[i] = new Entry(dids[i], titles[i], tags[i].isEmpty() ? new String[0] : tags[i].split("\n"));
-        HashMap<Long, Entry[]> next = new HashMap<>(index);
-        next.put(uid, entries);
-        index = next;
-    }
-
     public static void attachProfile(Object profile, Object view) {profiles.put(profile, view);}
 
     public static void detachProfile(Object profile) {profiles.remove(profile);}
 
+    /** Called on the UI thread whenever the tag buttons are rendered. */
     public static void setSearch(Object pager, Object view, int height) {
-        searches.put(pager, new Search(view, height));
-        try {applyPadding(pager);} catch (Throwable e) {report(e);}
+        if (!active) return;
+        try {
+            Search s = searches.get(pager);
+            if (s == null || s.root != view) {
+                if (s != null) unlisten(s);
+                View list = (View) get(pager, "searchListView");
+                s = new Search((View) view, list, height);
+                list.setOnScrollChangeListener(s);
+                list.addOnLayoutChangeListener(s);
+                searches.put(pager, s);
+            }
+            s.height = height;
+            applyPadding(pager);
+        } catch (Throwable e) {
+            report(e);
+        }
     }
 
-    public static void detachSearch(Object pager) {searches.remove(pager);}
+    public static void detachSearch(Object pager) {
+        Search s = searches.remove(pager);
+        if (s != null) unlisten(s);
+    }
 
     public static void reposition(Object profile) {
         if (!active) return;
         try {position(profile);} catch (Throwable e) {report(e);}
     }
 
-    // ---- Matching (mirrors clean_tag / normalized / tag_rank in Python) --
-
-    static String normalize(String value) {
-        String s = Normalizer.normalize(value == null ? "" : value, Normalizer.Form.NFKC);
-        StringBuilder b = new StringBuilder(s.length());
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            int type = Character.getType(c);
-            if (type != Character.FORMAT && type != Character.SURROGATE) b.append(c);
-        }
-        // Manual whitespace handling: Android's ICU regex rejects (?U).
-        String t = collapse(b.toString());
-        int start = 0;
-        while (start < t.length() && t.charAt(start) == '#') start++;
-        return collapse(t.substring(start)).toLowerCase(Locale.ROOT).replace('ё', 'е');
-    }
-
-    private static String collapse(String value) {
-        StringBuilder out = new StringBuilder(value.length());
-        boolean space = false;
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if (Character.isWhitespace(c) || Character.isSpaceChar(c)) {
-                space = out.length() > 0;
-            } else {
-                if (space) out.append(' ');
-                out.append(c);
-                space = false;
-            }
-        }
-        return out.toString();
-    }
-
-    static int rank(String query, String tag) {
-        if (query.isEmpty()) return -1;
-        if (tag.equals(query)) return 0;
-        if (tag.startsWith(query)) return 1;
-        if (tag.contains(query)) return 2;
-        for (String word : query.split(" ")) if (!tag.contains(word)) return -1;
-        return 3;
-    }
-
-    static List<Match> matches(long uid, String rawQuery) {
-        String query = normalize(rawQuery);
-        Entry[] entries = index.get(uid);
-        ArrayList<Match> out = new ArrayList<>();
-        if (query.isEmpty() || entries == null) return out;
-        for (Entry e : entries) {
-            int best = -1;
-            for (String tag : e.tags) {
-                int r = rank(query, tag);
-                if (r >= 0 && (best < 0 || r < best)) best = r;
-            }
-            if (best >= 0) out.add(new Match(e, best));
-        }
-        Collections.sort(out, (a, b) -> {
-            if (a.rank != b.rank) return a.rank - b.rank;
-            int c = a.entry.sortTitle.compareTo(b.entry.sortTitle);
-            return c != 0 ? c : Long.compare(a.entry.did, b.entry.did);
-        });
-        return out;
+    private static void unlisten(Search s) {
+        s.list.setOnScrollChangeListener(null);
+        s.list.removeOnLayoutChangeListener(s);
+        s.root.setTranslationY(0f);
     }
 
     // ---- Callbacks ------------------------------------------------------
@@ -220,7 +164,6 @@ public final class TagsBridge {
                 switch (kind) {
                     case HEIGHT: height(p); break;
                     case POSITION: position(p.thisObject); break;
-                    case SEARCH: search(p); break;
                     case PADDING: applyPadding(p.thisObject); break;
                     default: break;
                 }
@@ -291,94 +234,19 @@ public final class TagsBridge {
         view.setVisibility(visible ? 0 : 4);
     }
 
-    @SuppressWarnings("unchecked")
-    private static void search(XC_MethodHook.MethodHookParam p) throws Exception {
-        if (((Number) p.args[0]).intValue() != 0) return; // peer pickers keep their own rules
-        Object storage = p.thisObject;
-        int account = ((Number) get(storage, "currentAccount")).intValue();
-        Class<?> config = cls("org.telegram.messenger.UserConfig");
-        long uid = ((Number) call(staticCall(config, "getInstance", account), "getClientUserId")).longValue();
-        List<Match> found = matches(uid, String.valueOf(p.args[1]));
-        if (found.isEmpty()) return;
-        List<Object> results = (List<Object>) p.args[2];
-        List<Object> names = (List<Object>) p.args[3];
-        List<Object> encUsers = (List<Object>) p.args[4];
-        List<?> allowed = (List<?>) p.args[5];
-        Set<Long> allowedIds = null;
-        if (allowed != null) {
-            allowedIds = new HashSet<>();
-            for (Object v : allowed) allowedIds.add(((Number) v).longValue());
-        }
-        Set<Long> existing = new HashSet<>();
-        for (Object obj : results) existing.add(objectId(obj));
-        Class<?> dialogs = cls("org.telegram.messenger.DialogObject");
-        Object controller = staticCall(cls("org.telegram.messenger.MessagesController"), "getInstance", account);
-        Class<?> userObject = cls("org.telegram.messenger.UserObject");
-        Class<?> tlUser = cls("org.telegram.tgnet.TLRPC$User");
-        Class<?> tlChat = cls("org.telegram.tgnet.TLRPC$Chat");
-        // Pairs are appended together so ProfileSearchCell receives aligned arrays.
-        for (Match m : found) {
-            long did = m.entry.did;
-            if (existing.contains(did) || (allowedIds != null && !allowedIds.contains(did))) continue;
-            Object obj, encUser = null;
-            if ((Boolean) staticCall(dialogs, "isEncryptedDialog", did)) {
-                int encId = ((Number) staticCall(dialogs, "getEncryptedChatId", did)).intValue();
-                obj = call(controller, "getEncryptedChat", Integer.valueOf(encId));
-                if (obj == null) obj = call(storage, "getEncryptedChat", (long) encId);
-                if (obj == null) continue;
-                long userId = ((Number) get(obj, "user_id")).longValue();
-                encUser = call(controller, "getUser", Long.valueOf(userId));
-                if (encUser == null) encUser = call(storage, "getUser", userId);
-                if (encUser == null) continue;
-            } else if (did < 0) {
-                obj = call(controller, "getChat", Long.valueOf(-did));
-                if (obj == null) obj = call(storage, "getChat", -did);
-            } else {
-                obj = call(controller, "getUser", Long.valueOf(did));
-                if (obj == null) obj = call(storage, "getUser", did);
-            }
-            if (obj == null || (tlUser.isInstance(obj) && (Boolean) get(obj, "deleted"))) continue;
-            String title;
-            if (tlChat.isInstance(obj)) {
-                Object t = get(obj, "title");
-                title = t != null && !t.toString().isEmpty() ? t.toString() : m.entry.title;
-            } else {
-                title = String.valueOf(staticCall(userObject, "getUserName", encUser != null ? encUser : obj));
-            }
-            results.add(obj);
-            names.add(title);
-            if (encUser != null) {
-                // ProfileSearchCell resolves encrypted chats from this cache.
-                call(controller, "putEncryptedChat", obj, true);
-                encUsers.add(encUser);
-            }
-            existing.add(did);
-        }
-    }
-
-    private static long objectId(Object obj) throws Exception {
-        if (obj == null) return 0;
-        if (cls("org.telegram.tgnet.TLRPC$User").isInstance(obj)) return ((Number) get(obj, "id")).longValue();
-        if (cls("org.telegram.tgnet.TLRPC$Chat").isInstance(obj)) return -((Number) get(obj, "id")).longValue();
-        if (cls("org.telegram.tgnet.TLRPC$EncryptedChat").isInstance(obj))
-            return 0x4000000000000000L | (((Number) get(obj, "id")).longValue() & 0xffffffffL);
-        return 0;
-    }
-
     static void applyPadding(Object pager) throws Exception {
         Search s = searches.get(pager);
         if (s == null) return;
         int top = ((Number) get(pager, "pagesPaddingTop")).intValue();
         int bottom = ((Number) get(pager, "pagesPaddingBottom")).intValue();
-        View list = (View) get(pager, "searchListView");
+        View list = s.list;
         exact(list.getClass(), "setPadding", int.class, int.class, int.class, int.class, boolean.class)
                 .invoke(list, list.getPaddingLeft(), top + s.height, list.getPaddingRight(), bottom, false);
-        View root = (View) s.view;
-        ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) root.getLayoutParams();
+        ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) s.root.getLayoutParams();
         if (params.topMargin != top || params.height != s.height) {
             params.topMargin = top;
             params.height = s.height;
-            root.setLayoutParams(params);
+            s.root.setLayoutParams(params);
         }
         View empty = (View) get(pager, "emptyView");
         if (empty != null) {
@@ -388,7 +256,35 @@ public final class TagsBridge {
                 empty.setLayoutParams(ep);
             }
         }
-        root.bringToFront();
+        s.root.bringToFront();
+        sync(s);
+    }
+
+    /**
+     * The buttons sit in the list's top padding (the list does not clip to it),
+     * so they move by exactly as much as the first row has scrolled.
+     */
+    static float offset(boolean firstRowShown, int firstTop, int listPaddingTop, int hiddenShift) {
+        if (!firstRowShown) return -hiddenShift;
+        return Math.min(0, firstTop - listPaddingTop);
+    }
+
+    static void sync(Search s) {
+        if (!active) return;
+        try {
+            ViewGroup list = (ViewGroup) s.list;
+            float shift = 0f;
+            if (list.getChildCount() > 0) {
+                View first = list.getChildAt(0);
+                int position = ((Number) exact(list.getClass(), "getChildAdapterPosition", View.class)
+                        .invoke(list, first)).intValue();
+                ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) s.root.getLayoutParams();
+                shift = offset(position == 0, first.getTop(), list.getPaddingTop(), params.topMargin + s.height);
+            }
+            if (s.root.getTranslationY() != shift) s.root.setTranslationY(shift);
+        } catch (Throwable e) {
+            report(e);
+        }
     }
 
     // ---- Cached reflection ----------------------------------------------
@@ -428,8 +324,6 @@ public final class TagsBridge {
     }
 
     private static Object get(Object obj, String name) throws Exception {return field(obj.getClass(), name).get(obj);}
-
-    private static void set(Object obj, String name, Object value) throws Exception {field(obj.getClass(), name).set(obj, value);}
 
     private static Object staticField(String className, String name) throws Exception {
         return field(cls(className), name).get(null);

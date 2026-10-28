@@ -19,7 +19,7 @@ if ($LASTEXITCODE) { throw 'Java checks failed' }
 $helperJar = Join-Path $build 'helper.jar'
 $stubJar = Join-Path $build 'stubs.jar'
 # Only the helper goes into the DEX; stubs and tests are build fixtures.
-& (Join-Path $jdk 'bin\jar.exe') cf $helperJar -C $classes chat/tags/TagsBridge.class -C $classes 'chat/tags/TagsBridge$Entry.class' -C $classes 'chat/tags/TagsBridge$Match.class' -C $classes 'chat/tags/TagsBridge$Search.class' -C $classes 'chat/tags/TagsBridge$Callback.class'
+& (Join-Path $jdk 'bin\jar.exe') cf $helperJar -C $classes chat/tags/TagsBridge.class -C $classes 'chat/tags/TagsBridge$Search.class' -C $classes 'chat/tags/TagsBridge$Callback.class'
 if ($LASTEXITCODE) { throw 'Helper packaging failed' }
 & (Join-Path $jdk 'bin\jar.exe') cf $stubJar -C $classes de -C $classes app -C $classes android
 if ($LASTEXITCODE) { throw 'Stub packaging failed' }

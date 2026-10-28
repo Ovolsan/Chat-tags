@@ -55,7 +55,7 @@ def main():
         counts = [len(re.split(r",(?![^<]*>)", sig)) if sig.strip() else 0 for sig in signatures]
         assert counts.count(expected) == 1, (alias, name, expected, counts)
         methods.append(f"{alias}.{name}/{expected}")
-    assert len(methods) == 11, methods
+    assert len(methods) == 10, methods
     storage = (JAVA / mappings["Storage"]).read_text(encoding="utf-8")
     controller = (JAVA / "org/telegram/messenger/BaseController.java").read_text(encoding="utf-8")
     assert "MessagesStorage extends BaseController" in storage

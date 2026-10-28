@@ -166,6 +166,7 @@ class FakeView:
         self.children, self.padding = [], (0, 0, 0, 0)
         self.params = self.LayoutParams(-1, -2)
         self.visibility, self.click = 0, None
+        self.translation, self.top, self.position = 0.0, 0, 0
 
     @staticmethod
     def LayoutParams(width, height):
@@ -192,6 +193,12 @@ class FakeView:
     def setText(self, value): self.text = value
     def setOnClickListener(self, fn): self.click = fn
     def removeAllViews(self): self.children.clear()
+    def getChildCount(self): return len(self.children)
+    def getChildAt(self, index): return self.children[index]
+    def getChildAdapterPosition(self, child): return child.position
+    def getTop(self): return self.top
+    def getTranslationY(self): return self.translation
+    def setTranslationY(self, value): self.translation = value
     def addView(self, child, params):
         child.params = params
         self.children.append(child)
@@ -207,6 +214,8 @@ class SearchSuggestionsTests(unittest.TestCase):
         self.instance.Ellipsize = types.SimpleNamespace(END=0)
         self.instance._background = lambda color: None
         self.instance._text = lambda context, text, *args: FakeView(text=text)
+        self.settings = {plugin.AVATARS_KEY: False}
+        self.instance.get_setting = lambda key, default: self.settings.get(key, default)
         pager = types.SimpleNamespace(
             searchContainer=FakeView(width=220, height=500),
             searchListView=FakeView(), emptyView=FakeView(),
@@ -245,6 +254,34 @@ class SearchSuggestionsTests(unittest.TestCase):
         self.assertEqual(opened, [-3])
         self.instance._toggle_suggestions(self.state)
         self.assertEqual(len(self.state["rows"].children), 2)
+
+    def test_avatar_precedes_title_and_can_be_disabled(self):
+        self.settings[plugin.AVATARS_KEY] = True
+        self.instance._avatar = lambda context, match, account: FakeView(width=22)
+        self.render()
+        chip = self.state["rows"].children[0].children[0]
+        self.assertEqual(len(chip.children), 2)
+        self.assertEqual(chip.children[0].width, 22)
+        self.assertEqual(chip.children[1].text, self.state["matches"][0]["title"])
+        self.settings[plugin.AVATARS_KEY] = False
+        self.render()
+        self.assertEqual(self.state["rows"].children[0].children[0].children, [])
+
+    def test_buttons_scroll_away_with_the_first_result(self):
+        self.render()
+        view = self.state["pager"].searchListView
+        view.padding = (0, 100, 0, 0)
+        first = FakeView()
+        view.children.append(first)
+        first.top = 100
+        self.instance._sync_search_scroll(self.state)
+        self.assertEqual(self.state["root"].translation, 0)
+        first.top = 40
+        self.instance._sync_search_scroll(self.state)
+        self.assertEqual(self.state["root"].translation, -60)
+        first.position = 3
+        self.instance._sync_search_scroll(self.state)
+        self.assertLess(self.state["root"].translation, -self.state["height"])
 
     def test_three_short_names_fit_and_need_no_expand_button(self):
         for n, match in enumerate(self.state["matches"]):
@@ -361,60 +398,6 @@ class HookBehaviorTests(unittest.TestCase):
         self.storage = Storage()
         self.storage.chats[7] = Chat(7)
         self.instance._index.set(100, -7, "Рыболовы", ["рыбалка"])
-
-    def search(self, query="рыбалка", results=None, names=None, dialog_type=0, allowed=None):
-        results = JavaList(results or [])
-        names = JavaList(names or [])
-        enc_users = JavaList()
-        allowed = JavaList(allowed) if allowed is not None else None
-        param = HookParam(self.storage, [dialog_type, query, results, names, enc_users, allowed, -1])
-        self.instance._local_search(param)
-        return results, names, enc_users
-
-    def test_search_hydrates_from_storage_after_cold_start(self):
-        results, names, _ = self.search()
-        self.assertEqual(results[0].id, 7)
-        self.assertEqual(names, ["Рыболовы"])
-
-    def test_native_and_tag_matches_do_not_duplicate(self):
-        existing = Chat(7)
-        results, names, _ = self.search(results=[existing], names=["Native name"])
-        self.assertEqual(results, [existing])
-        self.assertEqual(names, ["Native name"])
-
-    def test_result_and_name_arrays_remain_aligned(self):
-        self.storage.chats[8] = Chat(8, "Второй")
-        self.instance._index.set(100, -8, "Второй", ["рыбалка"])
-        results, names, _ = self.search()
-        self.assertEqual(len(results), len(names))
-        self.assertEqual([(obj.title, name) for obj, name in zip(list.__iter__(results), list.__iter__(names))],
-                         [(name, name) for name in list.__iter__(names)])
-
-    def test_peer_pickers_and_allowlists_are_respected(self):
-        self.assertEqual(self.search(dialog_type=15)[0], [])
-        self.assertEqual(self.search(allowed=[-8])[0], [])
-        self.assertEqual(len(self.search(allowed=[-7])[0]), 1)
-
-    def test_missing_or_deleted_objects_are_skipped(self):
-        self.instance._index.set(100, 8, "Удалённый", ["рыбалка"])
-        self.storage.users[8] = User(8, deleted=True)
-        self.instance._index.set(100, -9, "Пропавший", ["рыбалка"])
-        self.assertEqual(len(self.search()[0]), 1)
-
-    def test_other_account_does_not_receive_tags(self):
-        self.storage.currentAccount = 1
-        self.assertEqual(self.search()[0], [])
-
-    def test_secret_chat_is_cached_for_native_search_cells(self):
-        did = plugin.encrypted_dialog_id(42)
-        self.instance._index.set(100, did, "Секретный", ["рыбалка"])
-        self.storage.encrypted[42] = Encrypted(42, 17)
-        self.storage.users[17] = User(17, "Секретный")
-        results, names, users = self.search()
-        self.assertEqual(len(results), 2)
-        self.assertIn("Секретный", names)
-        self.assertEqual(users[0].id, 17)
-        self.assertIn(42, self.instance._test_controller.encrypted)
 
     def test_profile_reserves_space_once(self):
         profile = types.SimpleNamespace(getDialogId=lambda: -7)
