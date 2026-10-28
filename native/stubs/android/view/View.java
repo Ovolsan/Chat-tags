@@ -26,4 +26,5 @@ public class View {
     public void setOnScrollChangeListener(OnScrollChangeListener l) {}
     public void addOnLayoutChangeListener(OnLayoutChangeListener l) {}
     public void removeOnLayoutChangeListener(OnLayoutChangeListener l) {}
+    public ViewTreeObserver getViewTreeObserver() {return null;}
 }

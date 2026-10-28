@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.WeakHashMap;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 
@@ -21,17 +22,23 @@ import de.robv.android.xposed.XposedBridge;
 public final class TagsBridge {
     static final int HEIGHT = 0, POSITION = 1, PADDING = 2;
 
-    /** Tag buttons above one search list; they scroll away with its first row. */
-    static final class Search implements View.OnScrollChangeListener, View.OnLayoutChangeListener {
+    /**
+     * Tag buttons above one search list; they scroll away with its first row.
+     * Checked before every frame, so scrolling, relayout and padding changes
+     * are all reflected without waiting for a scroll event.
+     */
+    static final class Search implements ViewTreeObserver.OnPreDrawListener {
         final View root, list;
+        final ViewTreeObserver observer;
         int height;
-        Search(View r, View l, int h) {root = r; list = l; height = h;}
+        boolean failed;
+        Search(View r, View l, int h) {root = r; list = l; height = h; observer = l.getViewTreeObserver();}
 
         @Override
-        public void onScrollChange(View v, int x, int y, int oldX, int oldY) {sync(this);}
-
-        @Override
-        public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {sync(this);}
+        public boolean onPreDraw() {
+            sync(this);
+            return true;
+        }
     }
 
     private static volatile boolean active;
@@ -123,8 +130,7 @@ public final class TagsBridge {
                 if (s != null) unlisten(s);
                 View list = (View) get(pager, "searchListView");
                 s = new Search((View) view, list, height);
-                list.setOnScrollChangeListener(s);
-                list.addOnLayoutChangeListener(s);
+                s.observer.addOnPreDrawListener(s);
                 searches.put(pager, s);
             }
             s.height = height;
@@ -145,8 +151,7 @@ public final class TagsBridge {
     }
 
     private static void unlisten(Search s) {
-        s.list.setOnScrollChangeListener(null);
-        s.list.removeOnLayoutChangeListener(s);
+        if (s.observer.isAlive()) s.observer.removeOnPreDrawListener(s);
         s.root.setTranslationY(0f);
     }
 
@@ -240,8 +245,17 @@ public final class TagsBridge {
         int top = ((Number) get(pager, "pagesPaddingTop")).intValue();
         int bottom = ((Number) get(pager, "pagesPaddingBottom")).intValue();
         View list = s.list;
+        int oldTop = list.getPaddingTop(), newTop = top + s.height;
+        int scrolled = scrolledFromTop(s);
         exact(list.getClass(), "setPadding", int.class, int.class, int.class, int.class, boolean.class)
-                .invoke(list, list.getPaddingLeft(), top + s.height, list.getPaddingRight(), bottom, false);
+                .invoke(list, list.getPaddingLeft(), newTop, list.getPaddingRight(), bottom, false);
+        if (newTop != oldTop && scrolled >= 0) {
+            // Otherwise the list keeps the first row where it was, so expanding
+            // the buttons would look like they open upwards over the results.
+            Object manager = exact(list.getClass(), "getLayoutManager").invoke(list);
+            exact(manager.getClass(), "scrollToPositionWithOffset", int.class, int.class)
+                    .invoke(manager, 0, -scrolled);
+        }
         ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) s.root.getLayoutParams();
         if (params.topMargin != top || params.height != s.height) {
             params.topMargin = top;
@@ -269,8 +283,19 @@ public final class TagsBridge {
         return Math.min(0, firstTop - listPaddingTop);
     }
 
+    /** How far the first row is scrolled under the buttons; -1 when it is off screen. */
+    private static int scrolledFromTop(Search s) throws Exception {
+        ViewGroup list = (ViewGroup) s.list;
+        if (list.getChildCount() == 0) return 0;
+        View first = list.getChildAt(0);
+        int position = ((Number) exact(list.getClass(), "getChildAdapterPosition", View.class)
+                .invoke(list, first)).intValue();
+        if (position != 0) return -1;
+        return Math.max(0, list.getPaddingTop() - first.getTop());
+    }
+
     static void sync(Search s) {
-        if (!active) return;
+        if (!active || s.failed) return;
         try {
             ViewGroup list = (ViewGroup) s.list;
             float shift = 0f;
@@ -283,6 +308,7 @@ public final class TagsBridge {
             }
             if (s.root.getTranslationY() != shift) s.root.setTranslationY(shift);
         } catch (Throwable e) {
+            s.failed = true; // runs every frame: report once
             report(e);
         }
     }

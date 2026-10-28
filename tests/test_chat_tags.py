@@ -140,6 +140,19 @@ class JavaList(list):
         raise TypeError("'ArrayList' object is not iterable")
 
 
+class TitleLimitTests(unittest.TestCase):
+    def test_titles_keep_whole_words_count_and_ellipsis(self):
+        self.assertEqual(plugin.shorten_title("Рыболовы", 0), "Рыболовы")
+        self.assertEqual(plugin.shorten_title("Рыболовы", 10), "Рыболовы")
+        self.assertEqual(plugin.shorten_title("Рыболовы Подмосковья", 10), "Рыболовы…")
+        self.assertEqual(plugin.shorten_title("  Два   пробела  ", 30), "Два пробела")
+
+    def test_unknown_setting_value_keeps_titles_whole(self):
+        self.assertEqual(plugin.title_limit(None), 0)
+        self.assertEqual(plugin.title_limit(99), 0)
+        self.assertEqual(plugin.title_limit(4), 30)
+
+
 class SearchLayoutTests(unittest.TestCase):
     def test_several_chats_share_a_row(self):
         self.assertEqual(plugin.pack_chat_rows([70, 80, 60, 70], 222, 6),
@@ -167,6 +180,7 @@ class FakeView:
         self.params = self.LayoutParams(-1, -2)
         self.visibility, self.click = 0, None
         self.translation, self.top, self.position = 0.0, 0, 0
+        self.scrolled_to = []
 
     @staticmethod
     def LayoutParams(width, height):
@@ -196,6 +210,9 @@ class FakeView:
     def getChildCount(self): return len(self.children)
     def getChildAt(self, index): return self.children[index]
     def getChildAdapterPosition(self, child): return child.position
+    def getLayoutManager(self):
+        return types.SimpleNamespace(
+            scrollToPositionWithOffset=lambda pos, offset: self.scrolled_to.append((pos, offset)))
     def getTop(self): return self.top
     def getTranslationY(self): return self.translation
     def setTranslationY(self, value): self.translation = value
@@ -282,6 +299,22 @@ class SearchSuggestionsTests(unittest.TestCase):
         first.position = 3
         self.instance._sync_search_scroll(self.state)
         self.assertLess(self.state["root"].translation, -self.state["height"])
+
+    def test_expanding_keeps_first_result_below_the_buttons(self):
+        self.render()
+        view = self.state["pager"].searchListView
+        first = FakeView()
+        first.top = view.getPaddingTop() - 15  # scrolled 15 px under the buttons
+        view.children.append(first)
+        self.instance._toggle_suggestions(self.state)
+        self.assertEqual(view.scrolled_to[-1], (0, -15))
+
+    def test_long_titles_are_cut_by_the_setting(self):
+        self.settings[plugin.TITLE_LIMIT_KEY] = 2  # 15 characters
+        self.render()
+        chip = self.state["rows"].children[0].children[0]
+        self.assertEqual(chip.text, "Очень длинное…")
+        self.assertLessEqual(len(chip.text), 15)
 
     def test_three_short_names_fit_and_need_no_expand_button(self):
         for n, match in enumerate(self.state["matches"]):
